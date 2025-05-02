@@ -16,10 +16,10 @@ services:
       - key: PORT
         value: 10000
       - key: SERVER_NAME
-        value: tagio.onrender.com
+        value: tagio-server.onrender.com
     
     # Render automatically sets PORT=10000 for web services
-    # The server is internally bound to port 10000, but clients should connect on 443
+    # The server is internally bound to port 10000, but clients should connect on port 80
     autoDeploy: true
     # Scaling settings (Pro+ plans only)
     scaling:
@@ -28,9 +28,9 @@ services:
     # Increased deployment timeout for slower builds
     initialDeployHook: echo "Starting TagIO Relay Server deployment"
     # Configure TCP proxy instead of HTTP proxy
-    # The key is to ensure that port 443 is treated as raw TCP, not HTTP
+    # Use port 80 instead of 443 to avoid HTTP protocol enforcement
     tcpPorts:
-      - port: 443
+      - port: 80
         name: tagio-tcp
         proxy:
           port: 10000

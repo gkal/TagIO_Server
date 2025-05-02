@@ -8,8 +8,8 @@ Write-Host ""
 
 # Test DNS resolution
 Write-Host "1. Testing DNS resolution..."
-$serverName = "tagio.onrender.com"
-$oldServerName = "tagio-server.onrender.com"
+$serverName = "tagio-server.onrender.com"
+$oldServerName = "tagio.onrender.com"
 
 try {
     $dnsResult = Resolve-DnsName -Name $serverName -ErrorAction Stop
@@ -22,118 +22,86 @@ try {
 
 try {
     $oldDnsResult = Resolve-DnsName -Name $oldServerName -ErrorAction Stop
-    Write-Host "   ⚠️ OLD server name ($oldServerName) is also resolving" -ForegroundColor Yellow
+    Write-Host "   ℹ️ DNS Resolution also successful for $oldServerName" -ForegroundColor Blue
     Write-Host "      IP Address: $($oldDnsResult.IP4Address)"
-    Write-Host "      This should not be used anymore."
 } catch {
-    Write-Host "   ℹ️ Old server name ($oldServerName) does not resolve (this is good)" -ForegroundColor Blue
+    Write-Host "   ❓ DNS Resolution failed for $oldServerName" -ForegroundColor Yellow
+    Write-Host "      Error: $_"
 }
 
 Write-Host ""
-Write-Host "2. Testing connectivity to different ports..."
+Write-Host "2. Testing TCP connectivity..."
 
-$ports = @(443, 80, 10000, 3000, 7568)
-
-foreach ($port in $ports) {
-    Write-Host "   Testing $serverName on port $port..." -NoNewline
-    
-    try {
-        $connection = Test-NetConnection -ComputerName $serverName -Port $port -ErrorAction Stop -WarningAction SilentlyContinue
-        
-        if ($connection.TcpTestSucceeded) {
-            if ($port -eq 443) {
-                Write-Host " ✅ CONNECTED" -ForegroundColor Green
-                Write-Host "      This is the PRIMARY port you should use"
-            } elseif ($port -in @(80, 7568)) {
-                Write-Host " ✅ CONNECTED" -ForegroundColor Green
-                Write-Host "      This is a FALLBACK port"
-            } else {
-                Write-Host " ⚠️ CONNECTED" -ForegroundColor Yellow
-                Write-Host "      This port should not be used directly"
-            }
-        } else {
-            Write-Host " ❌ FAILED" -ForegroundColor Red
-        }
-    } catch {
-        Write-Host " ❌ ERROR: $_" -ForegroundColor Red
-    }
-}
-
-Write-Host ""
-Write-Host "3. Testing protocol detection (checking for HTTP responses)..."
-
-# Function to test if we get HTTP response
-function Test-HttpResponse {
-    param (
-        [string]$Server,
-        [int]$Port
-    )
-    
-    try {
-        $tcpClient = New-Object System.Net.Sockets.TcpClient
-        $tcpClient.Connect($Server, $Port)
-        
-        if ($tcpClient.Connected) {
-            $stream = $tcpClient.GetStream()
-            $writer = New-Object System.IO.StreamWriter($stream)
-            $reader = New-Object System.IO.StreamReader($stream)
-            
-            # Send a simple HTTP GET request
-            $writer.WriteLine("GET / HTTP/1.1")
-            $writer.WriteLine("Host: $Server")
-            $writer.WriteLine("Connection: Close")
-            $writer.WriteLine("")
-            $writer.Flush()
-            
-            # Read the first line of response
-            $response = $reader.ReadLine()
-            
-            $tcpClient.Close()
-            
-            if ($response -like "HTTP*") {
-                return $true, $response
-            } else {
-                return $false, $response
-            }
-        } else {
-            return $false, "Connection failed"
-        }
-    } catch {
-        return $false, "Error: $_"
-    }
-}
-
-$portsToCheck = @(443, 80)
-
-foreach ($port in $portsToCheck) {
-    Write-Host "   Testing for HTTP response on port $port..." -NoNewline
-    
-    $result, $response = Test-HttpResponse -Server $serverName -Port $port
-    
-    if ($result) {
-        Write-Host " ⚠️ RECEIVED HTTP RESPONSE" -ForegroundColor Yellow
-        Write-Host "      First line: $response"
-        if ($port -eq 443) {
-            Write-Host "      This might be why your TagIO client is failing to connect."
-            Write-Host "      Render.com is treating TCP traffic on port 443 as HTTP traffic."
-        }
+# Test port 80 (Primary TCP port)
+Write-Host "   Testing connection to $serverName:80 (Primary TCP port)..."
+try {
+    $tcp80Result = Test-NetConnection -ComputerName $serverName -Port 80 -ErrorAction Stop -WarningAction SilentlyContinue
+    if ($tcp80Result.TcpTestSucceeded) {
+        Write-Host "   ✅ Successfully connected to $serverName:80" -ForegroundColor Green
     } else {
-        if ($response -like "Error*") {
-            Write-Host " ❌ ERROR: $response" -ForegroundColor Red
-        } else {
-            Write-Host " ✅ NO HTTP RESPONSE (Good for TagIO protocol)" -ForegroundColor Green
-        }
+        Write-Host "   ❌ Failed to connect to $serverName:80" -ForegroundColor Red
+    }
+} catch {
+    Write-Host "   ❌ Error testing connection to $serverName:80" -ForegroundColor Red
+    Write-Host "      Error: $_"
+}
+
+# Test port 443 (Alternative port)
+Write-Host "   Testing connection to $serverName:443 (Alternative port)..."
+try {
+    $tcp443Result = Test-NetConnection -ComputerName $serverName -Port 443 -ErrorAction Stop -WarningAction SilentlyContinue
+    if ($tcp443Result.TcpTestSucceeded) {
+        Write-Host "   ✅ Successfully connected to $serverName:443" -ForegroundColor Green
+    } else {
+        Write-Host "   ❌ Failed to connect to $serverName:443" -ForegroundColor Red
+    }
+} catch {
+    Write-Host "   ❌ Error testing connection to $serverName:443" -ForegroundColor Red
+    Write-Host "      Error: $_"
+}
+
+# Test port 7568 (Fallback port)
+Write-Host "   Testing connection to $serverName:7568 (Fallback port)..."
+try {
+    $tcp7568Result = Test-NetConnection -ComputerName $serverName -Port 7568 -ErrorAction Stop -WarningAction SilentlyContinue
+    if ($tcp7568Result.TcpTestSucceeded) {
+        Write-Host "   ✅ Successfully connected to $serverName:7568" -ForegroundColor Green
+    } else {
+        Write-Host "   ❌ Failed to connect to $serverName:7568" -ForegroundColor Red
+    }
+} catch {
+    Write-Host "   ❌ Error testing connection to $serverName:7568" -ForegroundColor Red
+    Write-Host "      Error: $_"
+}
+
+Write-Host ""
+Write-Host "3. Summary:"
+Write-Host "--------------------------------------------------------"
+$dnsStatus = if ($null -ne $dnsResult) { "✅ Success" } else { "❌ Failed" }
+$port80Status = if ($tcp80Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
+$port443Status = if ($tcp443Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
+$port7568Status = if ($tcp7568Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
+
+Write-Host "DNS Resolution:         $dnsStatus"
+Write-Host "Port 80 (Primary):      $port80Status"
+Write-Host "Port 443 (Alternative): $port443Status"
+Write-Host "Port 7568 (Fallback):   $port7568Status"
+Write-Host "--------------------------------------------------------"
+Write-Host ""
+
+if ($tcp80Result.TcpTestSucceeded) {
+    Write-Host "✅ Primary connection test successful!" -ForegroundColor Green
+    Write-Host "   Your client should be able to connect to the TagIO relay server."
+} else {
+    if ($tcp443Result.TcpTestSucceeded -or $tcp7568Result.TcpTestSucceeded) {
+        Write-Host "⚠️ Primary connection failed, but alternative ports are available." -ForegroundColor Yellow
+        Write-Host "   You may need to configure your client to use a different port."
+    } else {
+        Write-Host "❌ All connection tests failed!" -ForegroundColor Red
+        Write-Host "   Please check your network configuration or contact support."
     }
 }
 
 Write-Host ""
-Write-Host "==============================================="
-Write-Host "RECOMMENDATION:"
-Write-Host "==============================================="
-Write-Host "Based on the test results, you should:"
-Write-Host "1. Ensure your client is using 'tagio.onrender.com' (not 'tagio-server.onrender.com')"
-Write-Host "2. Connect to port 443 despite potential HTTP interference"
-Write-Host "3. If using port 443 fails, try fallback ports 80 or 7568"
-Write-Host ""
-Write-Host "For full guidance, see client_troubleshooting.md"
+Write-Host "For client configuration help, see the client_port_fix.md file."
 Write-Host "===============================================" 
