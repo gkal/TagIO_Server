@@ -1,5 +1,7 @@
 # Rust build artifacts
-/target/
+target/
+**/target/
+TagIO/target/
 
 # IDE and editor files
 .idea/
