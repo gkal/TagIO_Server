@@ -4,6 +4,7 @@ version = "0.2.1"
 edition = "2021"
 authors = ["TagIO Team"]
 description = "TagIO Relay Server - Standalone NAT traversal server for TagIO"
+default-run = "http_tunnel_server"
 
 [features]
 default = ["server"]
@@ -41,4 +42,9 @@ http = "0.2.9"
 [[bin]]
 name = "tagio_relay_server"
 path = "src/main.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "http_tunnel_server"
+path = "src/bin/http_tunnel_server.rs"
 required-features = ["server"] 

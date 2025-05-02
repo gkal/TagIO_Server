@@ -2,36 +2,35 @@ services:
   - type: web
     name: tagio-relay-server
     env: rust
-    buildCommand: cargo build --release --bin tagio_relay_server
-    startCommand: PORT=10000 ./target/release/tagio_relay_server --force_cloud_ip --enable_protocol_detection
+    buildCommand: cargo build --release --bin http_tunnel_server
+    startCommand: PORT=10000 ./target/release/http_tunnel_server --port 10000
     region: frankfurt
     plan: starter
-    healthCheckPath: /health
+    healthCheckPath: /
     # The following envVars are used for configuration
     envVars:
       - key: AUTH_TOKEN
         sync: false # Set to false to allow custom values per environment
       - key: RUST_LOG
-        value: trace
+        value: info
       - key: PORT
         value: 10000
       - key: SERVER_NAME
         value: tagio-server.onrender.com
     
     # Render automatically sets PORT=10000 for web services
-    # The server is internally bound to port 10000, but clients should connect on port 80
     autoDeploy: true
     # Scaling settings (Pro+ plans only)
     scaling:
       minInstances: 1
       maxInstances: 1
     # Increased deployment timeout for slower builds
-    initialDeployHook: echo "Starting TagIO Relay Server deployment"
-    # Configure TCP proxy instead of HTTP proxy
-    # Using port 80 with protocol detection to handle both HTTP and TCP traffic
+    initialDeployHook: echo "Starting TagIO HTTP Tunnel Server deployment"
+    # HTTP tunnel server handles its own HTTP requests
+    # No need for TCP proxy configuration
     tcpPorts:
       - port: 80
-        name: tagio-tcp
+        name: tagio-http
         proxy:
           port: 10000
-          protocol: tcp 
+          protocol: http 
