@@ -22,4 +22,11 @@ services:
       minInstances: 1
       maxInstances: 1
     # Increased deployment timeout for slower builds
-    initialDeployHook: echo "Starting TagIO Relay Server deployment" 
+    initialDeployHook: echo "Starting TagIO Relay Server deployment"
+    # Configure TCP proxy instead of HTTP proxy
+    tcpPorts:
+      - port: 10000
+        name: tagio
+        proxy:
+          port: 443
+          protocol: tcp 
