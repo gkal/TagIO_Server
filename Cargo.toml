@@ -41,7 +41,7 @@ clap = { version = "4.4", features = ["derive"] }
 # IP address utilities
 local-ip-address = "0.5.6"
 # Simple HTTP client for public IP detection
-ureq = { version = "2.9.1", default-features = false, features = ["tls"] }
+reqwest = { version = "0.11", features = ["rustls-tls"] }
 
 [profile.release]
 opt-level = "z"     # Optimize for size, not speed

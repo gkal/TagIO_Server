@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 use anyhow::{Result, anyhow};
 use env_logger;
 use log;
+use reqwest;
 
 // Information about each connected client
 struct ClientInfo {
@@ -48,9 +49,8 @@ impl RelayServer {
         }
         println!("==========================================");
         
-        // Start the health check endpoint on port 8080
-        let health_check_addr = "0.0.0.0:8080";
-        let health_check_server = Self::run_health_check(health_check_addr);
+        // Note: We now start the health check in main() to ensure it's running
+        // before Render's port scan times out
         
         // Bind to the specified address for the main server
         println!("Attempting to bind to {}", bind_addr);
@@ -91,9 +91,6 @@ impl RelayServer {
         } else {
             println!("Authentication disabled - all connections will be accepted");
         }
-        
-        // Spawn health check task
-        tokio::spawn(health_check_server);
         
         // Accept and handle connections
         loop {
@@ -532,39 +529,6 @@ impl RelayServer {
         
         Ok(())
     }
-
-    // Add a new static method to run the health check endpoint
-    async fn run_health_check(addr: &str) {
-        match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                println!("Health check endpoint successfully bound to {}", addr);
-                println!("Health endpoint will respond with HTTP 200 OK to any request");
-                
-                loop {
-                    match listener.accept().await {
-                        Ok((mut socket, client_addr)) => {
-                            println!("Health check request from {}", client_addr);
-                            tokio::spawn(async move {
-                                // Simple HTTP response
-                                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                                match socket.write_all(response.as_bytes()).await {
-                                    Ok(_) => println!("Health check response sent to {}", client_addr),
-                                    Err(e) => println!("Failed to send health check response to {}: {}", client_addr, e),
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Error accepting health check connection: {}", e);
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                eprintln!("Failed to start health check endpoint on {}: {}", addr, e);
-                eprintln!("Health check will not be available - this may affect container orchestration");
-            }
-        }
-    }
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -586,17 +550,62 @@ async fn detect_public_ip() -> Result<String> {
     let services = [
         "https://api.ipify.org", 
         "https://ifconfig.me/ip", 
-        "https://ipecho.net/plain"
+        "https://ipecho.net/plain",
+        "https://checkip.amazonaws.com"
     ];
     
-    println!("On render.com, please use the PUBLIC_IP environment variable instead");
-    println!("Auto-detection may not work in cloud environments");
+    // Check if we're on render.com
+    let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
     
-    // We can't use curl directly in Rust, so let's return a manual message
-    println!("Automatic IP detection not available in this build.");
-    println!("Please manually set the PUBLIC_IP environment variable on Render.");
+    if is_render {
+        println!("Detected Render.com environment, attempting to determine outbound IP...");
+        
+        // Create a reqwest client with timeout
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        
+        // Try to connect to external services to determine our outbound IP
+        for service_url in &services {
+            println!("Trying to determine public IP using: {}", service_url);
+            
+            match client.get(*service_url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.text().await {
+                            Ok(ip) => {
+                                let ip = ip.trim();
+                                if !ip.is_empty() && ip.chars().all(|c| c.is_digit(10) || c == '.') {
+                                    println!("Successfully detected Render outbound IP: {}", ip);
+                                    println!("This is the static outbound IP for your Render region");
+                                    println!("NAT traversal will use this IP for optimal performance");
+                                    return Ok(ip.to_string());
+                                } else {
+                                    println!("Service returned invalid IP format: '{}'", ip);
+                                }
+                            },
+                            Err(e) => println!("Failed to read response from {}: {}", service_url, e)
+                        }
+                    } else {
+                        println!("Service {} returned error status: {}", service_url, response.status());
+                    }
+                },
+                Err(e) => println!("Failed to connect to {}: {}", service_url, e)
+            }
+        }
+        
+        // If all services failed, suggest manual configuration
+        println!("Could not auto-detect Render.com outbound IP address.");
+        println!("You can manually set the PUBLIC_IP environment variable in the Render dashboard.");
+        println!("Find your static outbound IP in the Render dashboard under Connect > Outbound.");
+        println!("This is important for optimal NAT traversal between clients.");
+    } else {
+        println!("Not running on Render.com, auto-detection might not be accurate.");
+        println!("For production, please manually set the PUBLIC_IP environment variable.");
+    }
     
-    Err(anyhow!("Automatic IP detection not implemented"))
+    Err(anyhow!("Could not auto-detect public IP address"))
 }
 
 fn prompt_yes_no(prompt: &str) -> bool {
@@ -635,6 +644,69 @@ fn is_potential_problematic_region(ip: &str) -> bool {
     false
 }
 
+// Start a health check server that responds to any HTTP request with 200 OK
+// This is critical for Render.com port detection to succeed
+async fn start_health_check_server() {
+    let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
+    
+    // Try multiple ports that Render might check
+    let health_check_ports = if is_render {
+        vec!["3000", "10000", "8080", "80"]
+    } else {
+        vec!["8080"]
+    };
+    
+    for port in health_check_ports {
+        let addr = format!("0.0.0.0:{}", port);
+        println!("Attempting to start health check server on {}", addr);
+        
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                println!("SUCCESS: Health check server listening on {}", addr);
+                
+                // Spawn a task to handle health check requests
+                tokio::spawn(async move {
+                    println!("Health check server active on {}", addr);
+                    
+                    loop {
+                        match listener.accept().await {
+                            Ok((mut socket, addr)) => {
+                                println!("Health check request from {}", addr);
+                                
+                                // Simple HTTP response - large enough to be detected
+                                let response = "HTTP/1.1 200 OK\r\n\
+                                               Content-Type: text/plain\r\n\
+                                               Content-Length: 22\r\n\
+                                               \r\n\
+                                               TagIO Relay Server Ready";
+                                
+                                // Send the response
+                                if let Err(e) = socket.write_all(response.as_bytes()).await {
+                                    println!("Failed to send health check response: {}", e);
+                                } else {
+                                    println!("Health check response sent to {}", addr);
+                                }
+                            },
+                            Err(e) => {
+                                println!("Error accepting health check connection: {}", e);
+                            }
+                        }
+                    }
+                });
+                
+                // Successfully started health check server
+                return;
+            },
+            Err(e) => {
+                println!("Failed to bind health check server to {}: {}", addr, e);
+            }
+        }
+    }
+    
+    println!("WARNING: Could not start health check server on any port");
+    println!("Render.com deployment may fail during port detection");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command-line arguments
@@ -663,6 +735,11 @@ async fn main() -> Result<()> {
     
     println!("=================================");
     
+    // IMPORTANT: Start health check server FIRST
+    // This ensures Render.com can detect our service quickly
+    println!("Starting health check server for Render.com port detection...");
+    start_health_check_server().await;
+    
     // Get binding address from environment variable or use default
     let bind_addr = if is_render {
         // On render.com, we should use the PORT environment variable
@@ -674,7 +751,7 @@ async fn main() -> Result<()> {
             Err(_) => {
                 println!("WARNING: Running on render.com but PORT environment variable not found!");
                 println!("This is unexpected and may cause binding errors");
-                "0.0.0.0:8443".to_string()
+                "0.0.0.0:10000".to_string() // Default Render port
             }
         }
     } else {
@@ -686,31 +763,51 @@ async fn main() -> Result<()> {
     
     println!("TagIO Relay Server v{}", env!("CARGO_PKG_VERSION"));
     println!("Starting relay server on {}", bind_addr);
-    println!("NOTE: On render.com, PORT is set by the platform and will be used automatically");
     
-    // Get public IP from environment variable or prompt
-    let public_ip = env::var("PUBLIC_IP").ok();
-    let public_ip = if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) {
+    // Get public IP from environment variable or auto-detect
+    let mut public_ip = env::var("PUBLIC_IP").ok();
+    
+    // If no PUBLIC_IP is set and we're on render.com, try to auto-detect
+    if public_ip.is_none() && is_render {
+        println!("No PUBLIC_IP environment variable set but running on Render.com");
+        println!("Attempting to auto-detect the Render.com outbound IP...");
+        
+        match detect_public_ip().await {
+            Ok(ip) => {
+                println!("Successfully auto-detected Render.com outbound IP: {}", ip);
+                println!("Using this IP for optimal NAT traversal");
+                public_ip = Some(ip);
+            }
+            Err(e) => {
+                println!("Failed to auto-detect outbound IP: {}", e);
+                println!("NAT traversal may not work optimally.");
+                println!("For best results, set the PUBLIC_IP environment variable in the Render dashboard.");
+            }
+        }
+    } else if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) {
+        // Only prompt in local/development environment, not on Render
         let auto_detect = prompt_yes_no("Do you want to auto-detect your public IP? (y/n)");
         if auto_detect {
             match detect_public_ip().await {
                 Ok(ip) => {
                     println!("Auto-detected public IP: {}", ip);
-                    Some(ip)
+                    public_ip = Some(ip);
                 }
                 Err(e) => {
                     eprintln!("Failed to auto-detect public IP: {}", e);
                     let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
-                    if manual_ip.is_empty() { None } else { Some(manual_ip) }
+                    if !manual_ip.is_empty() {
+                        public_ip = Some(manual_ip);
+                    }
                 }
             }
         } else {
             let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
-            if manual_ip.is_empty() { None } else { Some(manual_ip) }
+            if !manual_ip.is_empty() {
+                public_ip = Some(manual_ip);
+            }
         }
-    } else {
-        public_ip
-    };
+    }
     
     if let Some(ip) = &public_ip {
         println!("Using public IP address: {}", ip);
@@ -721,7 +818,7 @@ async fn main() -> Result<()> {
     // Get auth secret from environment variable or use default
     let auth_secret = env::var("AUTH_SECRET").ok();
     
-    // Run the relay server
+    // Run the relay server (remove the health check logic as we've already started it)
     let server = RelayServer::new(public_ip, auth_secret);
     match server.run(&bind_addr).await {
         Ok(_) => {
