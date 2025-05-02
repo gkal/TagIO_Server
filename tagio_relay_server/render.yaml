@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: tagio-relay-server
+    runtime: docker
+    region: oregon # Choose your region, e.g., oregon, frankfurt
+    plan: starter # Choose your plan
+    branch: main
+    rootDir: tagio_relay_server
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: RUST_LOG
+        value: info
+    ports:
+      - port: 443
+        handlers: ["http"]  # HTTPS will be handled by Render's proxy
+      - port: 8080
+        handlers: ["health"]  # Expose the health check port
+    healthCheckPath: /
+    healthCheckPort: 8080
+    autoDeploy: true 
