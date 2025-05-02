@@ -1,6 +1,9 @@
 use serde::{Serialize, Deserialize};
 use std::net::SocketAddr;
 
+/// Protocol version for detecting mismatches
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Messages used for NAT traversal
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum NatMessage {
@@ -30,4 +33,7 @@ pub enum NatMessage {
     // Keep-alive
     Ping,
     Pong,
+    
+    // Version check - added to help detect protocol mismatches
+    VersionCheck { version: u32 },
 } 

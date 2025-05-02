@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use anyhow::{Result, anyhow};
 use env_logger;
+use log;
 
 // Information about each connected client
 struct ClientInfo {
@@ -36,20 +37,52 @@ impl RelayServer {
     
     // Start the relay server
     async fn run(&self, bind_addr: &str) -> io::Result<()> {
+        // Log environment details
+        println!("=== TagIO Cloud Relay Server Environment ===");
+        println!("OS: {}", env::consts::OS);
+        println!("ARCH: {}", env::consts::ARCH);
+        for (key, value) in env::vars() {
+            if key.starts_with("RENDER_") || key == "PORT" || key == "PUBLIC_IP" || key == "AUTH_SECRET" {
+                println!("ENV: {} = {}", key, value);
+            }
+        }
+        println!("==========================================");
+        
         // Start the health check endpoint on port 8080
         let health_check_addr = "0.0.0.0:8080";
         let health_check_server = Self::run_health_check(health_check_addr);
         
         // Bind to the specified address for the main server
-        let listener = TcpListener::bind(bind_addr).await?;
+        println!("Attempting to bind to {}", bind_addr);
+        let listener = match TcpListener::bind(bind_addr).await {
+            Ok(l) => {
+                println!("SUCCESS: Bound to {}", bind_addr);
+                l
+            },
+            Err(e) => {
+                println!("ERROR: Failed to bind to {}: {}", bind_addr, e);
+                println!("This error is expected in local environments where port 443 is privileged or in use.");
+                println!("On render.com production environment, this should succeed.");
+                return Err(e);
+            }
+        };
         println!("TagIO relay server listening on {}", bind_addr);
         
         // Log the public IP if provided
         if let Some(ip) = &self.public_ip {
             println!("Server public IP configured as: {}", ip);
+            println!("NAT traversal should work optimally with configured public IP");
         } else {
             println!("WARNING: No public IP configured. NAT traversal may not work correctly!");
-            println!("You should specify a public IP in the configuration.");
+            println!("For optimal NAT traversal, set the PUBLIC_IP environment variable on Render.com");
+            println!("Without PUBLIC_IP set, NAT traversal between clients behind symmetric NATs may fail");
+            println!("The server will use client-perceived addresses, which may be inaccurate behind complex NATs");
+            
+            if env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok() {
+                println!("IMPORTANT: You are running on Render.com. Set PUBLIC_IP in the environment variables section");
+                println!("You can find your Render service's static outbound IP in the 'Connect' tab");
+                println!("See: https://render.com/docs/static-outbound-ip-addresses");
+            }
         }
         
         // Log authentication status
@@ -64,36 +97,49 @@ impl RelayServer {
         
         // Accept and handle connections
         loop {
-            let (socket, addr) = listener.accept().await?;
-            println!("New connection from {}", addr);
-            
-            // Use public IP if configured, otherwise use the detected address
-            let public_addr = if let Some(ip) = &self.public_ip {
-                let port = addr.port();
-                match IpAddr::from_str(ip) {
-                    Ok(ip_addr) => {
-                        println!("Using configured public IP: {}", ip_addr);
-                        SocketAddr::new(ip_addr, port)
-                    },
-                    Err(_) => {
-                        println!("Failed to parse configured public IP: {}", ip);
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    println!("New connection from {} (local address: {})", addr, socket.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap()));
+                    
+                    // Use public IP if configured, otherwise use the detected address
+                    let public_addr = if let Some(ip) = &self.public_ip {
+                        let port = addr.port();
+                        match IpAddr::from_str(ip) {
+                            Ok(ip_addr) => {
+                                println!("Using configured public IP: {} (instead of {})", ip_addr, addr.ip());
+                                SocketAddr::new(ip_addr, port)
+                            },
+                            Err(_) => {
+                                println!("Failed to parse configured public IP: {}", ip);
+                                println!("Falling back to socket address: {}", addr);
+                                addr
+                            }
+                        }
+                    } else {
+                        println!("No configured public IP, using detected IP: {}", addr);
                         addr
-                    }
+                    };
+                    
+                    // Log active connections count
+                    let client_count = self.clients.lock().await.len();
+                    println!("Active connections before accepting new client: {}", client_count);
+                    
+                    // Handle the connection in a new task
+                    let clients = self.clients.clone();
+                    let auth_secret = self.auth_secret.clone();
+                    
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_client(socket, addr, public_addr, clients, auth_secret).await {
+                            eprintln!("Error handling client {}: {} ({:?})", addr, e, e.kind());
+                        }
+                    });
+                },
+                Err(e) => {
+                    eprintln!("Error accepting connection: {}", e);
+                    // Brief pause to avoid CPU spinning on repeated errors
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            } else {
-                println!("Using detected IP: {}", addr);
-                addr
-            };
-            
-            // Handle the connection in a new task
-            let clients = self.clients.clone();
-            let auth_secret = self.auth_secret.clone();
-            
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(socket, addr, public_addr, clients, auth_secret).await {
-                    eprintln!("Error handling client {}: {}", addr, e);
-                }
-            });
+            }
         }
     }
     
@@ -105,6 +151,23 @@ impl RelayServer {
         clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
         auth_secret: Option<String>,
     ) -> io::Result<()> {
+        println!("=== New Client Connection ===");
+        println!("Socket address: {}", addr);
+        println!("Public address: {}", public_addr);
+        println!("Authentication required: {}", auth_secret.is_some());
+        println!("Socket info: {:?}", socket);
+        
+        // Check for potential regional connectivity issues
+        let ip = addr.ip().to_string();
+        // Log if connection is from a region with known Render.com connectivity issues
+        if is_potential_problematic_region(&ip) {
+            println!("NOTE: Client connecting from a region that may experience connectivity issues with Render.com");
+            println!("If clients report connection problems, consider using a different cloud provider");
+            println!("See: https://community.render.com/t/solved-infinite-loading-for-all-of-our-services-in-frankfurt-region-from-nigeria/4626");
+        }
+        
+        println!("==============================");
+        
         // Create a channel for sending messages to this client
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         
@@ -176,25 +239,29 @@ impl RelayServer {
         
         // Verify authentication if enabled
         if let Some(secret) = auth_secret {
+            println!("Authentication required for client {}", client_id);
+            
             // Read authentication data
             let mut auth_len_bytes = [0u8; 4];
             match tokio::time::timeout(Duration::from_secs(10), reader.read_exact(&mut auth_len_bytes)).await {
                 Ok(result) => {
                     if let Err(e) = result {
-                        println!("Error reading auth data length: {}", e);
+                        println!("Error reading auth data length for client {}: {}", client_id, e);
                         return Err(e);
                     }
                 },
                 Err(_) => {
-                    println!("Timeout reading auth data length");
+                    println!("Timeout reading auth data length for client {}", client_id);
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout reading auth data"));
                 }
             }
             
             let auth_len = u32::from_be_bytes(auth_len_bytes) as usize;
+            println!("Client {} provided auth data of length {}", client_id, auth_len);
+            
             if auth_len > 1000 {
                 // Prevent excessive memory allocation
-                println!("Auth data too long: {}", auth_len);
+                println!("Auth data too long for client {}: {}", client_id, auth_len);
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Auth data too long"));
             }
             
@@ -222,19 +289,24 @@ impl RelayServer {
             
             // Verify the authentication secret
             if auth_str != secret {
-                println!("Authentication failed for client {}", client_id);
+                println!("Authentication failed for client {}: invalid secret", client_id);
+                println!("Expected secret length: {}, received: {}", secret.len(), auth_str.len());
                 
                 // Send auth failure message
                 let mut msg = Vec::new();
                 msg.extend_from_slice(&2u32.to_be_bytes()); // Message type 2 = auth failure
                 if let Err(e) = writer_tx.send(msg).await {
-                    println!("Error sending auth failure: {}", e);
+                    println!("Error sending auth failure to client {}: {}", client_id, e);
+                } else {
+                    println!("Sent auth failure message to client {}", client_id);
                 }
                 
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Authentication failed"));
             }
             
             println!("Client {} authenticated successfully", client_id);
+        } else {
+            println!("Authentication is disabled, client {} accepted without auth", client_id);
         }
         
         println!("Client {} registered as '{}'", addr, client_id);
@@ -247,9 +319,19 @@ impl RelayServer {
                 _sender: tx.clone(),
             });
             
+            // Log NAT traversal diagnostic info
+            println!("NAT traversal diagnostics for new client '{}':", client_id);
+            println!("  - Client public endpoint: {}", public_addr);
+            println!("  - Current active clients: {}", clients_map.len());
+            
             // Send connection info to all other clients
+            let mut sent_count = 0;
             for (other_id, other_client) in clients_map.iter() {
                 if other_id != &client_id {
+                    println!("  - Attempting NAT traversal setup between '{}' and '{}'", client_id, other_id);
+                    println!("    * '{}' endpoint: {}", client_id, public_addr);
+                    println!("    * '{}' endpoint: {}", other_id, other_client._public_addr);
+                    
                     // Format connection info message:
                     // 1. 4 bytes for message type (1 = connection info)
                     // 2. 4 bytes for ID length
@@ -272,10 +354,17 @@ impl RelayServer {
                     // Port
                     msg.extend_from_slice(&public_addr.port().to_be_bytes());
                     
-                    let _ = other_client._sender.send(msg).await;
-                    println!("Sent connection info about {} to {}", client_id, other_id);
+                    let res = other_client._sender.send(msg).await;
+                    if res.is_ok() {
+                        sent_count += 1;
+                        println!("    * Sent connection info about '{}' to '{}'", client_id, other_id);
+                    } else {
+                        println!("    * FAILED to send connection info about '{}' to '{}'", client_id, other_id);
+                    }
                 }
             }
+            
+            println!("NAT traversal setup completed. Sent client info to {} other clients", sent_count);
         }
         
         // Send acknowledgment with public address
@@ -348,18 +437,24 @@ impl RelayServer {
                     // Handle lookup request
                     3 => {
                         if n < 8 {
+                            println!("Received incomplete lookup request from client {}", client_id);
                             continue; // Not enough data
                         }
                         
                         let id_len = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
                         if n < 8 + id_len {
+                            println!("Received lookup request with insufficient data from client {}", client_id);
                             continue; // Not enough data
                         }
                         
                         let id_slice = &buffer[8..8 + id_len];
                         if let Ok(lookup_id) = String::from_utf8(id_slice.to_vec()) {
+                            println!("=== NAT Traversal Lookup ===");
+                            println!("Client '{}' looking up client '{}'", client_id, lookup_id);
+                            
                             // Look up the client info
                             let clients_map = clients.lock().await;
+                            println!("Currently registered clients: {}", clients_map.len());
                             
                             if let Some(info) = clients_map.get(&lookup_id) {
                                 // Send the client info
@@ -383,9 +478,14 @@ impl RelayServer {
                                 
                                 if let Err(e) = writer_tx.send(response).await {
                                     println!("Error sending lookup response: {}", e);
+                                } else {
+                                    println!("NAT traversal handshake: Sent endpoint info about '{}' to '{}'", lookup_id, client_id);
+                                    println!("  - '{}' endpoint: {}", lookup_id, info._public_addr);
+                                    println!("  - Now clients will attempt direct connection (UDP hole punching)");
                                 }
                                 
-                                println!("Client {} looked up client {}", client_id, lookup_id);
+                                println!("Client '{}' looked up client '{}' - FOUND", client_id, lookup_id);
+                                println!("===========================");
                             } else {
                                 // Client not found
                                 let mut response = Vec::new();
@@ -400,9 +500,12 @@ impl RelayServer {
                                 
                                 if let Err(e) = writer_tx.send(response).await {
                                     println!("Error sending lookup response: {}", e);
+                                } else {
+                                    println!("Sent 'not found' response to '{}'", client_id);
                                 }
                                 
-                                println!("Client {} looked up client {} (not found)", client_id, lookup_id);
+                                println!("Client '{}' looked up client '{}' - NOT FOUND", client_id, lookup_id);
+                                println!("===========================");
                             }
                         }
                     },
@@ -434,20 +537,31 @@ impl RelayServer {
     async fn run_health_check(addr: &str) {
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                println!("Health check endpoint listening on {}", addr);
+                println!("Health check endpoint successfully bound to {}", addr);
+                println!("Health endpoint will respond with HTTP 200 OK to any request");
                 
                 loop {
-                    if let Ok((mut socket, _)) = listener.accept().await {
-                        tokio::spawn(async move {
-                            // Simple HTTP response
-                            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                            let _ = socket.write_all(response.as_bytes()).await;
-                        });
+                    match listener.accept().await {
+                        Ok((mut socket, client_addr)) => {
+                            println!("Health check request from {}", client_addr);
+                            tokio::spawn(async move {
+                                // Simple HTTP response
+                                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                                match socket.write_all(response.as_bytes()).await {
+                                    Ok(_) => println!("Health check response sent to {}", client_addr),
+                                    Err(e) => println!("Failed to send health check response to {}: {}", client_addr, e),
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Error accepting health check connection: {}", e);
+                        }
                     }
                 }
             },
             Err(e) => {
-                eprintln!("Failed to start health check endpoint: {}", e);
+                eprintln!("Failed to start health check endpoint on {}: {}", addr, e);
+                eprintln!("Health check will not be available - this may affect container orchestration");
             }
         }
     }
@@ -467,6 +581,16 @@ fn prompt_input(prompt: &str) -> String {
 async fn detect_public_ip() -> Result<String> {
     // Use a simple HTTP service to detect public IP
     println!("Detecting public IP address...");
+    
+    // Try to detect via multiple services
+    let services = [
+        "https://api.ipify.org", 
+        "https://ifconfig.me/ip", 
+        "https://ipecho.net/plain"
+    ];
+    
+    println!("On render.com, please use the PUBLIC_IP environment variable instead");
+    println!("Auto-detection may not work in cloud environments");
     
     // We can't use curl directly in Rust, so let's return a manual message
     println!("Automatic IP detection not available in this build.");
@@ -488,21 +612,81 @@ fn prompt_yes_no(prompt: &str) -> bool {
     input == "y" || input == "yes"
 }
 
+// Function to check if an IP might be from a region with known connectivity issues
+fn is_potential_problematic_region(ip: &str) -> bool {
+    // This is a very basic implementation 
+    // In production, you'd want to use a proper IP geolocation database
+    
+    // Example: Check if the IP might be from regions with known Render.com connectivity issues
+    // These are just examples and not comprehensive
+    let problematic_prefixes = [
+        // Some Nigerian ISP prefixes (example)
+        "41.58.", "41.75.", "41.76.", "41.84.", "41.86.", "41.184.", "41.190.",
+        "41.203.", "41.204.", "41.215.", "41.217.", "41.219.", "41.220.", "41.221.",
+        // Add other regions with known issues as needed
+    ];
+    
+    for prefix in problematic_prefixes {
+        if ip.starts_with(prefix) {
+            return true;
+        }
+    }
+    
+    false
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     
     // Initialize logging
-    env_logger::init();
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+    
+    println!("=== TagIO Relay Server Starting ===");
+    println!("Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("Args: {:?}", args);
+    println!("Working directory: {:?}", env::current_dir().unwrap_or_default());
+    
+    // Check if running on render.com
+    let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
+    println!("Running on render.com: {}", is_render);
+    if is_render {
+        println!("Detected render.com environment - optimized for cloud deployment");
+        println!("Service ID: {}", env::var("RENDER_SERVICE_ID").unwrap_or_else(|_| "unknown".to_string()));
+        println!("Instance ID: {}", env::var("RENDER_INSTANCE_ID").unwrap_or_else(|_| "unknown".to_string()));
+    } else {
+        println!("Running in local/custom environment");
+    }
+    
+    println!("=================================");
     
     // Get binding address from environment variable or use default
-    let bind_addr = env::var("PORT")
-        .map(|port| format!("0.0.0.0:{}", port))
-        .unwrap_or_else(|_| "0.0.0.0:443".to_string());
+    let bind_addr = if is_render {
+        // On render.com, we should use the PORT environment variable
+        match env::var("PORT") {
+            Ok(port) => {
+                println!("Using render.com assigned port: {}", port);
+                format!("0.0.0.0:{}", port)
+            },
+            Err(_) => {
+                println!("WARNING: Running on render.com but PORT environment variable not found!");
+                println!("This is unexpected and may cause binding errors");
+                "0.0.0.0:8443".to_string()
+            }
+        }
+    } else {
+        // For local development
+        env::var("PORT")
+            .map(|port| format!("0.0.0.0:{}", port))
+            .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
+    };
     
     println!("TagIO Relay Server v{}", env!("CARGO_PKG_VERSION"));
     println!("Starting relay server on {}", bind_addr);
+    println!("NOTE: On render.com, PORT is set by the platform and will be used automatically");
     
     // Get public IP from environment variable or prompt
     let public_ip = env::var("PUBLIC_IP").ok();
@@ -539,10 +723,27 @@ async fn main() -> Result<()> {
     
     // Run the relay server
     let server = RelayServer::new(public_ip, auth_secret);
-    if let Err(e) = server.run(&bind_addr).await {
-        eprintln!("Error running server: {}", e);
-        return Err(anyhow!("Server error: {}", e));
+    match server.run(&bind_addr).await {
+        Ok(_) => {
+            println!("Server terminated normally");
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("Error running server: {}", e);
+            eprintln!("Error details: {:?}", e);
+            
+            // Check for specific error conditions
+            if e.kind() == io::ErrorKind::AddrInUse {
+                eprintln!("Address already in use error - this is common in local development");
+                eprintln!("On render.com, the PORT environment variable is managed by the platform");
+                eprintln!("and should be available when the container starts");
+            }
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                eprintln!("Permission denied error - cannot bind to privileged port");
+                eprintln!("On render.com, this should not happen as the container runs with sufficient privileges");
+            }
+            
+            Err(anyhow!("Server error: {}", e))
+        }
     }
-    
-    Ok(())
 } 

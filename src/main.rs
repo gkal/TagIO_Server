@@ -16,12 +16,14 @@ mod server;
 
 use constants::DEFAULT_BIND_ADDRESS;
 use server::RelayServer;
+use messages::PROTOCOL_VERSION;
 
 /// TagIO Relay Server - NAT traversal and relay server for TagIO remote desktop
+/// Designed to run on tagio-server.onrender.com in production
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about=None)]
 struct CliArgs {
-    /// Bind address for the server (default: 0.0.0.0:443)
+    /// Bind address for the server (default: 0.0.0.0:8443)
     #[clap(short, long, value_name = "ADDRESS:PORT")]
     bind: Option<String>,
     
@@ -109,7 +111,7 @@ async fn main() -> Result<()> {
         println!("=== TagIO Relay Server Interactive Setup ===");
         
         // Bind address
-        let input_bind = prompt_input("Enter bind address (default: 0.0.0.0:443)");
+        let input_bind = prompt_input(&format!("Enter bind address (default: {})", DEFAULT_BIND_ADDRESS));
         if !input_bind.is_empty() {
             bind_addr = input_bind;
         }
@@ -164,11 +166,27 @@ async fn main() -> Result<()> {
         auth_secret = args.auth;
     }
     
-    // Initialize the relay server
-    let server = RelayServer::new(public_ip, auth_secret);
-    
     // Run the server
     info!("Starting TagIO relay server...");
+    println!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
+    println!("Protocol Version: {}", PROTOCOL_VERSION);
+    println!("Bind Address: {}", bind_addr);
+    if let Some(ip) = &public_ip {
+        println!("Public IP: {}", ip);
+    } else {
+        println!("Public IP: Auto-detect (cloud provider will assign)");
+    }
+    if auth_secret.is_some() {
+        println!("Authentication: Enabled with custom secret");
+    } else {
+        println!("Authentication: Enabled with default secret");
+    }
+    println!("==========================================");
+    
+    // Create server with cloned values
+    let server = RelayServer::new(public_ip.clone(), auth_secret.clone());
+    
+    // Run the server
     server.run(&bind_addr).await?;
     
     Ok(())

@@ -6,10 +6,16 @@ TagIO is a secure remote desktop application that provides NAT traversal capabil
 ## Hosted Relay Server
 
 The TagIO relay server is now hosted on Render.com:
-- **Server URL**: `tagio.onrender.com:443`
+- **Server URL**: `tagio-server.onrender.com:443`
 - **Documentation**: See `docs/render_server.md` for details
 
 The client automatically uses this hosted server by default, so no configuration is needed.
+
+## Recent Updates
+
+- **Protocol Versioning**: Added protocol versioning and magic bytes to improve connection reliability
+- **Error Handling**: Enhanced error detection for malformed messages and protocol mismatches
+- **HTTP Detection**: The server now properly responds to HTTP requests with an informative message
 
 ## Project Structure
 

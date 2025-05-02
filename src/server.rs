@@ -7,13 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use anyhow::{Result, anyhow};
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 
 use crate::constants::{
     CONNECTION_TIMEOUT_SECS, 
     HEALTH_CHECK_PORT,
     MAX_ID_LENGTH,
-    MAX_AUTH_LENGTH
+    MAX_AUTH_LENGTH,
+    PROTOCOL_MAGIC
 };
 use crate::messages::MessageType;
 

@@ -11,7 +11,8 @@ use std::{
 };
 use log::{debug, error, info, warn, trace};
 use crate::messages::NatMessage;
-use crate::constants::DEFAULT_AUTH_SECRET;
+use crate::constants::{DEFAULT_AUTH_SECRET, PROTOCOL_MAGIC};
+use crate::messages::PROTOCOL_VERSION;
 
 // Keep alive timeout
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -55,22 +56,26 @@ impl RelayServer {
     // Run the server and start accepting connections
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
         info!("Starting NAT traversal relay server on {}", bind_addr);
+        info!("This server is designed to run on tagio-server.onrender.com");
         
         // Bind the TCP listener to the specified address
         let listener = TcpListener::bind(bind_addr).await?;
         
         if let Some(public_ip) = &self.public_ip {
-            info!("Server configured with public IP: {}", public_ip);
+            info!("Server configured with explicit public IP: {}", public_ip);
+            info!("Using this IP for all NAT traversal operations");
         } else {
-            warn!("No public IP configured. NAT traversal may be limited.");
-            warn!("Server will use client-reported public addresses for NAT traversal.");
+            warn!("No public IP configured. NAT traversal will use cloud provider's assigned IP.");
+            info!("For cloud deployment, the server will determine client's public addresses automatically.");
         }
+        
+        info!("Server ready to accept client connections from around the world");
         
         // Accept incoming connections
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
-                    debug!("New connection from {}", addr);
+                    debug!("New connection from client at {}", addr);
                     
                     // Clone necessary state for the client handler
                     let server = self.clone();
@@ -115,23 +120,56 @@ impl RelayServer {
         let (control_tx, mut control_rx) = mpsc::channel::<NatMessage>(100);
         
         // Split the socket for concurrent reading and writing
-        let (mut read, mut write) = tokio::io::split(socket);
+        let (mut read, write) = tokio::io::split(socket);
+        
+        // Create a channel for HTTP responses that need to be sent outside the task
+        let (http_tx, mut http_rx) = mpsc::channel::<String>(5);
         
         // Spawn a task for sending messages to the client
         let write_task = {
+            let mut write = write; // Move write into the task
             tokio::spawn(async move {
-                while let Some(message) = control_rx.recv().await {
-                    trace!("Sending message to {}: {:?}", addr, message);
-                    match bincode::serialize(&message) {
-                        Ok(data) => {
-                            if let Err(e) = write.write_all(&data).await {
-                                error!("Error writing to client {}: {}", addr, e);
+                // Handle any HTTP responses sent through the channel
+                let mut check_http = true;
+                
+                while check_http || control_rx.recv().await.is_some() {
+                    // Check for HTTP response first
+                    if check_http {
+                        match tokio::time::timeout(Duration::from_millis(1), http_rx.recv()).await {
+                            Ok(Some(http_response)) => {
+                                if let Err(e) = write.write_all(http_response.as_bytes()).await {
+                                    error!("Error writing HTTP response to {}: {}", addr, e);
+                                    break;
+                                }
+                                // After sending HTTP response, close the connection
                                 break;
                             }
+                            _ => {
+                                // No HTTP response waiting, continue with normal protocol
+                                check_http = false;
+                            }
                         }
-                        Err(e) => {
-                            error!("Error serializing message for {}: {}", addr, e);
-                            break;
+                    }
+                    
+                    // Process normal client messages
+                    if let Some(message) = control_rx.recv().await {
+                        trace!("Sending message to {}: {:?}", addr, message);
+                        match bincode::serialize(&message) {
+                            Ok(data) => {
+                                // Add magic bytes at the beginning of every message for protocol verification
+                                let mut message_data = Vec::with_capacity(PROTOCOL_MAGIC.len() + data.len());
+                                message_data.extend_from_slice(&PROTOCOL_MAGIC);
+                                message_data.extend_from_slice(&data);
+                                
+                                if let Err(e) = write.write_all(&message_data).await {
+                                    error!("Error writing to client {}: {}", addr, e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error serializing message for {}: {}", addr, e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -139,10 +177,17 @@ impl RelayServer {
             })
         };
         
+        // Send version check message immediately upon connection
+        if let Err(e) = control_tx.send(NatMessage::VersionCheck { version: PROTOCOL_VERSION }).await {
+            error!("Failed to send version check to {}: {}", addr, e);
+            return Err(anyhow!("Failed to send version check"));
+        }
+        
         // Buffer for incoming data
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut client_id = String::new();
         let mut authenticated = false;
+        let mut version_checked = false;
         
         // Process messages from the client
         loop {
@@ -154,10 +199,50 @@ impl RelayServer {
                     break;
                 }
                 Ok(Ok(n)) => {
-                    // Deserialize the message
-                    match bincode::deserialize::<NatMessage>(&buffer[..n]) {
+                    // Check for magic bytes at the beginning
+                    if n < PROTOCOL_MAGIC.len() || buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
+                        debug!("Invalid protocol magic bytes from {}", addr);
+                        
+                        // Check if this might be an HTTP request
+                        if let Ok(magic_bytes) = std::str::from_utf8(&buffer[..std::cmp::min(4, n)]) {
+                            if n >= 4 && (magic_bytes == "HTTP" || magic_bytes.contains("GET") || magic_bytes.contains("POST")) {
+                                debug!("Received HTTP request from {}. This is not a TagIO client.", addr);
+                                // Create HTTP response and send it through the channel
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nTagIO Relay Server - Not a web service\r\n";
+                                if let Err(e) = http_tx.send(response.to_string()).await {
+                                    error!("Failed to send HTTP response for {}: {}", addr, e);
+                                }
+                                // Close the connection
+                                break;
+                            }
+                        }
+                        
+                        // Close the connection
+                        break;
+                    }
+                    
+                    // Deserialize the message (skip the magic bytes)
+                    match bincode::deserialize::<NatMessage>(&buffer[PROTOCOL_MAGIC.len()..n]) {
                         Ok(message) => {
                             trace!("Received message from {}: {:?}", addr, message);
+                            
+                            // Check for version mismatch first
+                            if !version_checked {
+                                if let NatMessage::VersionCheck { version } = &message {
+                                    if *version != PROTOCOL_VERSION {
+                                        warn!("Protocol version mismatch: client={}, server={}", version, PROTOCOL_VERSION);
+                                        let _ = control_tx.send(NatMessage::Error { 
+                                            message: format!("Protocol version mismatch. Server: {}, Client: {}", 
+                                                    PROTOCOL_VERSION, version)
+                                        }).await;
+                                        // Wait a bit then close
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        break;
+                                    }
+                                    version_checked = true;
+                                    continue;
+                                }
+                            }
                             
                             // Handle client authentication first
                             if !authenticated {
@@ -235,6 +320,17 @@ impl RelayServer {
                         }
                         Err(e) => {
                             warn!("Failed to deserialize message from {}: {}", addr, e);
+                            
+                            // If we get the same deserialization error repeatedly, it's likely a protocol mismatch
+                            if e.to_string().contains("expected variant index") {
+                                debug!("Protocol mismatch detected from {}. Closing connection.", addr);
+                                let _ = control_tx.send(NatMessage::Error { 
+                                    message: "Protocol version mismatch".to_string() 
+                                }).await;
+                                // Wait a bit then close
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                break;
+                            }
                             // Continue - the next message might be valid
                         }
                     }

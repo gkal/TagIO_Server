@@ -1,0 +1,21 @@
+services:
+  # TagIO Relay Server - Cloud NAT traversal server
+  - type: web
+    name: tagio-server
+    env: docker
+    plan: starter
+    repo: https://github.com/yourusername/TagIO_Server.git
+    branch: main
+    buildCommand: cd standalone_server && cargo build --release
+    startCommand: cd standalone_server && ./target/release/tagio_relay_server --bind 0.0.0.0:$PORT
+    # Automatic TLS certificates for 0.0.0.0:443
+    domains:
+      - tagio-server.onrender.com
+    envVars:
+      - key: RUST_LOG
+        value: warn
+      # Optional environment variables - uncomment if needed
+      # - key: AUTH_SECRET
+      #   value: your_secret_here
+      # - key: PUBLIC_IP
+      #   sync: false 

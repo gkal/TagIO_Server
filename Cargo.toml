@@ -7,8 +7,41 @@
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 [workspace]
-members = ["tagio_relay_server"]
-default-members = ["tagio_relay_server"]
+members = ["standalone_server"]
+default-members = ["standalone_server"]
+
+[package]
+name = "tagio_relay_server_standalone"
+version = "0.1.9"
+edition = "2021"
+authors = ["TagIO Team"]
+description = "TagIO Relay Server - Standalone NAT traversal server for TagIO"
+
+[features]
+default = ["server"]
+server = []
+
+[dependencies]
+# Core async runtime - only include what we need
+tokio = { version = "1.33.0", features = [
+    "rt-multi-thread", "macros", "sync", "time", "net", "io-util"
+]}
+# Error handling
+anyhow = "1.0.75"
+# Serialization - essential for the protocol
+serde = { version = "1.0.193", features = ["derive"] }
+bincode = "1.3.3"
+# Logging
+log = "0.4.20"
+env_logger = "0.10.0"
+# NAT traversal - necessary for peer connections
+socket2 = "0.5.9"
+# Command line argument parsing - simplified feature set
+clap = { version = "4.4", features = ["derive"] }
+# IP address utilities
+local-ip-address = "0.5.6"
+# Simple HTTP client for public IP detection
+ureq = { version = "2.9.1", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = "z"     # Optimize for size, not speed

@@ -16,8 +16,10 @@ mod server;
 
 use constants::DEFAULT_BIND_ADDRESS;
 use server::RelayServer;
+use messages::PROTOCOL_VERSION;
 
 /// TagIO Relay Server - NAT traversal and relay server for TagIO remote desktop
+/// Designed to run on tagio-server.onrender.com in production
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about=None)]
 struct CliArgs {
@@ -99,7 +101,7 @@ async fn main() -> Result<()> {
     }
     env_logger::init();
     
-    // Initialize variables with default values
+    // Initialize variables with default values for cloud deployment
     let mut bind_addr = DEFAULT_BIND_ADDRESS.to_string();
     let mut public_ip = None;
     let mut auth_secret = None;
@@ -164,11 +166,27 @@ async fn main() -> Result<()> {
         auth_secret = args.auth;
     }
     
-    // Initialize the relay server
-    let server = RelayServer::new(public_ip, auth_secret);
-    
     // Run the server
     info!("Starting TagIO relay server...");
+    println!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
+    println!("Protocol Version: {}", PROTOCOL_VERSION);
+    println!("Bind Address: {}", bind_addr);
+    if let Some(ip) = &public_ip {
+        println!("Public IP: {}", ip);
+    } else {
+        println!("Public IP: Auto-detect (cloud provider will assign)");
+    }
+    if auth_secret.is_some() {
+        println!("Authentication: Enabled with custom secret");
+    } else {
+        println!("Authentication: Enabled with default secret");
+    }
+    println!("==========================================");
+    
+    // Create server with cloned values
+    let server = RelayServer::new(public_ip.clone(), auth_secret.clone());
+    
+    // Run the server
     server.run(&bind_addr).await?;
     
     Ok(())
