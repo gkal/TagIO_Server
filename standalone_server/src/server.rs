@@ -8,10 +8,11 @@ use std::{
     sync::Arc,
     collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
+    net::IpAddr,
 };
 use log::{debug, error, info, warn, trace};
-use crate::messages::NatMessage;
-use crate::constants::{DEFAULT_AUTH_SECRET, PROTOCOL_MAGIC};
+use crate::messages::{NatMessage, NatTraversalType, NatType};
+use crate::constants::{DEFAULT_AUTH_SECRET, PROTOCOL_MAGIC, MAX_PORT_PREDICTION_RANGE, KEEP_ALIVE_INTERVAL_SECS, NAT_TRAVERSAL_TIMEOUT_SECS};
 use crate::messages::PROTOCOL_VERSION;
 
 // Keep alive timeout
@@ -20,6 +21,10 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_BUFFER_SIZE: usize = 8192;
 // Maximum number of unauthorized attempts before logging a warning
 const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
+// Ports to try in order of preference (prioritize Render's default port 10000)
+const PREFERRED_PORTS: [u16; 6] = [10000, 8080, 3000, 443, 80, 8000];
+// Health check server ports
+const HEALTH_CHECK_PORTS: [u16; 3] = [8888, 8080, 3000];
 
 // Information about a connected client
 struct ClientInfo {
@@ -55,11 +60,67 @@ impl RelayServer {
     
     // Run the server and start accepting connections
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
-        info!("Starting NAT traversal relay server on {}", bind_addr);
+        info!("Starting NAT traversal relay server...");
         info!("This server is designed to run on tagio-server.onrender.com");
         
-        // Bind the TCP listener to the specified address
-        let listener = TcpListener::bind(bind_addr).await?;
+        // Try to extract the IP part without the port
+        let base_ip = match bind_addr.rsplit_once(':') {
+            Some((ip, _)) => ip.to_string(),
+            None => "0.0.0.0".to_string() // Default to all interfaces if format is invalid
+        };
+        
+        info!("Base IP for binding: {}", base_ip);
+        
+        // Start health check server on a separate task
+        let health_server = Self::start_health_check_server(base_ip.clone());
+        tokio::spawn(health_server);
+        
+        // Try to bind to the user-provided address first
+        let listener_result = TcpListener::bind(bind_addr).await;
+        
+        let listener = match listener_result {
+            Ok(listener) => {
+                info!("Successfully bound to requested address: {}", bind_addr);
+                listener
+            },
+            Err(initial_err) => {
+                warn!("Failed to bind to requested address {}: {}", bind_addr, initial_err);
+                warn!("Attempting to bind to alternative ports...");
+                
+                // Try binding to alternative ports
+                let mut last_error = initial_err;
+                let mut success = false;
+                let mut bound_port = 0;
+                
+                for port in PREFERRED_PORTS.iter() {
+                    let alt_addr = format!("{}:{}", base_ip, port);
+                    match TcpListener::bind(&alt_addr).await {
+                        Ok(listener) => {
+                            info!("Successfully bound to alternative address: {}", alt_addr);
+                            bound_port = *port;
+                            success = true;
+                            break;
+                        },
+                        Err(e) => {
+                            warn!("Failed to bind to {}: {}", alt_addr, e);
+                            last_error = e;
+                        }
+                    }
+                }
+                
+                if !success {
+                    error!("Failed to bind to any port. Last error: {}", last_error);
+                    return Err(anyhow!("Failed to bind to any port: {}", last_error));
+                }
+                
+                // Bind to the successful port
+                let final_addr = format!("{}:{}", base_ip, bound_port);
+                TcpListener::bind(&final_addr).await?
+            }
+        };
+        
+        let local_addr = listener.local_addr()?;
+        info!("Server successfully bound and listening on {}", local_addr);
         
         if let Some(public_ip) = &self.public_ip {
             info!("Server configured with explicit public IP: {}", public_ip);
@@ -94,6 +155,74 @@ impl RelayServer {
                 }
             }
         }
+    }
+    
+    // Start a health check HTTP server that can be used by cloud providers to verify the service is running
+    async fn start_health_check_server(base_ip: String) -> Result<()> {
+        info!("Starting health check HTTP server...");
+        
+        // Try each port in sequence
+        for port in HEALTH_CHECK_PORTS.iter() {
+            let addr = format!("{}:{}", base_ip, port);
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    info!("Health check server successfully bound to {}", addr);
+                    
+                    // Spawn the health check server loop
+                    tokio::spawn(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((mut socket, addr)) => {
+                                    debug!("Health check request from {}", addr);
+                                    
+                                    // Spawn a task to handle this health check request
+                                    tokio::spawn(async move {
+                                        let mut buffer = [0; 1024];
+                                        
+                                        // Read the HTTP request
+                                        match socket.read(&mut buffer).await {
+                                            Ok(n) if n > 0 => {
+                                                // Simple HTTP server that responds to any request with 200 OK
+                                                let response = "HTTP/1.1 200 OK\r\n\
+                                                               Content-Type: text/plain\r\n\
+                                                               Content-Length: 19\r\n\
+                                                               Connection: close\r\n\
+                                                               \r\n\
+                                                               TagIO Server Healthy";
+                                                
+                                                if let Err(e) = socket.write_all(response.as_bytes()).await {
+                                                    error!("Failed to send health check response: {}", e);
+                                                }
+                                            },
+                                            Ok(_) => {
+                                                // Empty request, just ignore
+                                                debug!("Empty health check request");
+                                            },
+                                            Err(e) => {
+                                                error!("Error reading health check request: {}", e);
+                                            }
+                                        }
+                                    });
+                                },
+                                Err(e) => {
+                                    error!("Error accepting health check connection: {}", e);
+                                }
+                            }
+                        }
+                    });
+                    
+                    // Return success after starting the server
+                    return Ok(());
+                },
+                Err(e) => {
+                    warn!("Failed to bind health check server to {}: {}", addr, e);
+                    // Continue with next port
+                }
+            }
+        }
+        
+        warn!("Failed to start health check server on any port");
+        Ok(()) // Don't fail the main server just because health check failed
     }
     
     // Handle a client connection
@@ -197,27 +326,21 @@ impl RelayServer {
                     // Connection closed by client
                     debug!("Client {} disconnected", addr);
                     break;
-                }
+                },
                 Ok(Ok(n)) => {
-                    // Check for magic bytes at the beginning
-                    if n < PROTOCOL_MAGIC.len() || buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
-                        debug!("Invalid protocol magic bytes from {}", addr);
-                        
-                        // Check if this might be an HTTP request
-                        if let Ok(magic_bytes) = std::str::from_utf8(&buffer[..std::cmp::min(4, n)]) {
-                            if n >= 4 && (magic_bytes == "HTTP" || magic_bytes.contains("GET") || magic_bytes.contains("POST")) {
-                                debug!("Received HTTP request from {}. This is not a TagIO client.", addr);
-                                // Create HTTP response and send it through the channel
-                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nTagIO Relay Server - Not a web service\r\n";
-                                if let Err(e) = http_tx.send(response.to_string()).await {
-                                    error!("Failed to send HTTP response for {}: {}", addr, e);
-                                }
-                                // Close the connection
-                                break;
-                            }
+                    // Check for HTTP request (clients sometimes try HTTP first)
+                    if !authenticated && buffer.starts_with(b"GET ") || buffer.starts_with(b"POST ") || buffer.starts_with(b"HTTP") {
+                        debug!("Received HTTP request from {}, sending health response", addr);
+                        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 27\r\n\r\nTagIO NAT Traversal Server OK";
+                        if let Err(e) = http_tx.send(response.to_string()).await {
+                            error!("Failed to send HTTP response: {}", e);
                         }
-                        
-                        // Close the connection
+                        break;
+                    }
+                    
+                    // Verify magic bytes for the TagIO protocol
+                    if n < PROTOCOL_MAGIC.len() || &buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
+                        warn!("Invalid protocol magic bytes from {}", addr);
                         break;
                     }
                     
@@ -226,140 +349,186 @@ impl RelayServer {
                         Ok(message) => {
                             trace!("Received message from {}: {:?}", addr, message);
                             
-                            // Check for version mismatch first
-                            if !version_checked {
-                                if let NatMessage::VersionCheck { version } = &message {
-                                    if *version != PROTOCOL_VERSION {
-                                        warn!("Protocol version mismatch: client={}, server={}", version, PROTOCOL_VERSION);
-                                        let _ = control_tx.send(NatMessage::Error { 
-                                            message: format!("Protocol version mismatch. Server: {}, Client: {}", 
-                                                    PROTOCOL_VERSION, version)
-                                        }).await;
-                                        // Wait a bit then close
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                            // Process message based on type
+                            match message {
+                                // Check version compatibility
+                                NatMessage::VersionCheck { version } => {
+                                    if version != PROTOCOL_VERSION {
+                                        warn!("Protocol version mismatch from {}: got {}, expected {}", 
+                                              addr, version, PROTOCOL_VERSION);
+                                        if let Err(e) = control_tx.send(NatMessage::Error { 
+                                            message: format!("Protocol version mismatch: server={}, client={}", 
+                                                            PROTOCOL_VERSION, version)
+                                        }).await {
+                                            error!("Failed to send version error message: {}", e);
+                                        }
                                         break;
                                     }
                                     version_checked = true;
-                                    continue;
-                                }
-                            }
-                            
-                            // Handle client authentication first
-                            if !authenticated {
-                                match &message {
-                                    NatMessage::Authenticate { secret, client_id: id } => {
-                                        if secret == &self.auth_secret {
-                                            authenticated = true;
-                                            client_id = id.clone();
-                                            
-                                            // Register the client
-                                            self.register_client(id.clone(), public_addr, control_tx.clone()).await?;
-                                            
-                                            // Send acknowledgment with public address
-                                            control_tx.send(NatMessage::AuthAck { 
-                                                public_addr, 
-                                                message: format!("Authenticated as {}", id) 
-                                            }).await?;
-                                            
-                                            info!("Client {} registered with ID {}", addr, id);
+                                },
+                                
+                                // STUN-like binding request for NAT detection
+                                NatMessage::StunBindingRequest => {
+                                    if authenticated {
+                                        debug!("Received STUN binding request from client {}", client_id);
+                                        
+                                        // Send back the client's public address
+                                        if let Err(e) = control_tx.send(NatMessage::StunBindingResponse { 
+                                            public_addr 
+                                        }).await {
+                                            error!("Failed to send STUN binding response: {}", e);
                                         } else {
-                                            // Invalid authentication
-                                            let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                                            if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
-                                                warn!("Multiple unauthorized connection attempts detected ({})", attempts);
+                                            debug!("Sent STUN binding response to {}: {}", client_id, public_addr);
+                                            
+                                            // Try to detect the client's NAT type if we have enough information
+                                            if !client_id.is_empty() {
+                                                if let Err(e) = self.detect_nat_type(&client_id, public_addr, control_tx.clone()).await {
+                                                    debug!("NAT detection error for {}: {}", client_id, e);
+                                                }
                                             }
-                                            
-                                            // Send auth failure and close connection
-                                            let _ = control_tx.send(NatMessage::AuthError { 
-                                                message: "Invalid authentication secret".to_string() 
-                                            }).await;
-                                            
-                                            // Wait a bit before closing to allow the error to be sent
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                    } else {
+                                        warn!("Unauthenticated STUN binding request from {}", addr);
+                                        if let Err(e) = control_tx.send(NatMessage::Error { 
+                                            message: "Authentication required".to_string() 
+                                        }).await {
+                                            error!("Failed to send auth required error: {}", e);
+                                        }
+                                    }
+                                },
+                                
+                                // Authentication message
+                                NatMessage::Authenticate { secret, client_id: id } => {
+                                    // Even in a cloud environment, verify authentication
+                                    if secret == self.auth_secret {
+                                        authenticated = true;
+                                        client_id = id;
+                                        
+                                        info!("Client {} authenticated from {}", client_id, addr);
+                                        
+                                        // Register the client with its public address
+                                        if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
+                                            error!("Failed to register client {}: {}", client_id, e);
                                             break;
                                         }
-                                    }
-                                    _ => {
-                                        // Client must authenticate first
-                                        let _ = control_tx.send(NatMessage::AuthError { 
-                                            message: "Authentication required".to_string() 
-                                        }).await;
                                         
-                                        // Wait a bit before closing to allow the error to be sent
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        // Send authentication acknowledgment with public address info
+                                        if let Err(e) = control_tx.send(NatMessage::AuthAck { 
+                                            public_addr,
+                                            message: format!("Authenticated as {} from {}", client_id, public_addr) 
+                                        }).await {
+                                            error!("Failed to send auth ack to {}: {}", client_id, e);
+                                            break;
+                                        }
+                                    } else {
+                                        // Track unauthorized attempts
+                                        let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                                        if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
+                                            warn!("Multiple unauthorized authentication attempts: {}", attempts);
+                                        }
+                                        
+                                        // Send error
+                                        if let Err(e) = control_tx.send(NatMessage::AuthError { 
+                                            message: "Invalid authentication secret".to_string() 
+                                        }).await {
+                                            error!("Failed to send auth error: {}", e);
+                                        }
                                         break;
                                     }
-                                }
-                            } else {
-                                // Process authenticated client messages
-                                match message {
-                                    NatMessage::Ping => {
-                                        // Respond to ping with pong
-                                        if let Err(e) = control_tx.send(NatMessage::Pong).await {
-                                            error!("Failed to send pong to {}: {}", addr, e);
+                                },
+                                
+                                // Connect request
+                                NatMessage::ConnectRequest { target_id } => {
+                                    if authenticated {
+                                        debug!("Connect request from {} to {}", client_id, target_id);
+                                        if let Err(e) = self.handle_connect_request(&client_id, &target_id, control_tx.clone()).await {
+                                            warn!("Failed to establish connection from {} to {}: {}", client_id, target_id, e);
                                         }
+                                    } else {
+                                        warn!("Unauthenticated connect request from {}", addr);
+                                        if let Err(e) = control_tx.send(NatMessage::Error { 
+                                            message: "Authentication required".to_string() 
+                                        }).await {
+                                            error!("Failed to send auth required error: {}", e);
+                                        }
+                                        break;
                                     }
-                                    NatMessage::ConnectRequest { target_id } => {
-                                        // Handle connection request
-                                        self.handle_connect_request(&client_id, &target_id, control_tx.clone()).await?;
+                                },
+                                
+                                // Relay request
+                                NatMessage::RelayRequest { target_id, session_id } => {
+                                    if authenticated {
+                                        debug!("Relay request from {} to {} with session {}", client_id, target_id, session_id);
+                                        if let Err(e) = self.handle_relay_request(&client_id, &target_id, &session_id, control_tx.clone()).await {
+                                            warn!("Failed to establish relay from {} to {}: {}", client_id, target_id, e);
+                                        }
+                                    } else {
+                                        warn!("Unauthenticated relay request from {}", addr);
+                                        if let Err(e) = control_tx.send(NatMessage::Error { 
+                                            message: "Authentication required".to_string() 
+                                        }).await {
+                                            error!("Failed to send auth required error: {}", e);
+                                        }
+                                        break;
                                     }
-                                    NatMessage::RelayRequest { target_id, session_id } => {
-                                        // Handle relay request
-                                        self.handle_relay_request(&client_id, &target_id, &session_id, control_tx.clone()).await?;
+                                },
+                                
+                                // Relay data
+                                NatMessage::RelayData { session_id, data } => {
+                                    if authenticated {
+                                        if let Err(e) = self.handle_relay_data(&session_id, data).await {
+                                            debug!("Error relaying data for session {}: {}", session_id, e);
+                                        }
+                                    } else {
+                                        warn!("Unauthenticated relay data from {}", addr);
+                                        break;
                                     }
-                                    NatMessage::RelayData { session_id, data } => {
-                                        // Forward relay data
-                                        self.handle_relay_data(&session_id, data).await?;
+                                },
+                                
+                                // Ping for keep-alive
+                                NatMessage::Ping => {
+                                    // Send pong response
+                                    if let Err(e) = control_tx.send(NatMessage::Pong).await {
+                                        error!("Failed to send pong to {}: {}", addr, e);
+                                        break;
                                     }
-                                    _ => {
-                                        // Other message types can be handled as needed
-                                        trace!("Unhandled message type from {}: {:?}", addr, message);
-                                    }
+                                },
+                                
+                                // Ignore other messages - they are meant for clients
+                                _ => {
+                                    debug!("Ignoring client-bound message from {}: {:?}", addr, message);
                                 }
                             }
-                        }
+                        },
                         Err(e) => {
-                            warn!("Failed to deserialize message from {}: {}", addr, e);
-                            
-                            // If we get the same deserialization error repeatedly, it's likely a protocol mismatch
-                            if e.to_string().contains("expected variant index") {
-                                debug!("Protocol mismatch detected from {}. Closing connection.", addr);
-                                let _ = control_tx.send(NatMessage::Error { 
-                                    message: "Protocol version mismatch".to_string() 
-                                }).await;
-                                // Wait a bit then close
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                break;
-                            }
-                            // Continue - the next message might be valid
+                            error!("Failed to deserialize message from {}: {}", addr, e);
+                            // Don't break here - could be a corrupted message
                         }
                     }
-                }
+                },
                 Ok(Err(e)) => {
                     error!("Error reading from client {}: {}", addr, e);
                     break;
-                }
+                },
                 Err(_) => {
-                    // Timeout occurred
-                    debug!("Read timeout for client {}, sending ping", addr);
-                    
-                    // Send ping to check if client is still alive
-                    if let Err(e) = control_tx.send(NatMessage::Ping).await {
-                        error!("Failed to send ping to {}: {}", addr, e);
-                        break;
-                    }
+                    // Connection timed out
+                    debug!("Connection to {} timed out", addr);
+                    break;
                 }
             }
         }
         
-        // Clean up client resources
-        if !client_id.is_empty() {
-            debug!("Removing client {} ({})", client_id, addr);
+        // Client disconnected, clean up
+        debug!("Client connection from {} ended", addr);
+        
+        // Unregister client if it was authenticated
+        if authenticated && !client_id.is_empty() {
             let mut clients = self.clients.lock().await;
             clients.remove(&client_id);
+            info!("Client {} unregistered", client_id);
         }
         
-        // Abort write task
+        // Cancel writer task
         write_task.abort();
         
         Ok(())
@@ -385,41 +554,93 @@ impl RelayServer {
     
     // Handle a connect request from one client to another
     async fn handle_connect_request(&self, client_id: &str, target_id: &str, control_sender: mpsc::Sender<NatMessage>) -> Result<()> {
-        debug!("Connect request from {} to {}", client_id, target_id);
-        
-        // Get client info
         let clients = self.clients.lock().await;
         
-        // Get target client info
+        // Check if target client exists
         if let Some(target_client) = clients.get(target_id) {
-            // Send connection info to the requestor
-            control_sender.send(NatMessage::ConnectionInfo {
-                client_id: target_id.to_string(),
-                public_addr: target_client.public_addr,
-                private_addrs: Vec::new(), // No private addresses in this implementation
-            }).await?;
+            debug!("Found target client {}, sending connection request", target_id);
             
-            // Send connect notification to the target
-            if let Err(e) = target_client.control_sender.send(NatMessage::ConnectNotification {
+            // Get requestor information
+            let req_client = match clients.get(client_id) {
+                Some(client) => client,
+                None => return Err(anyhow!("Requestor client not found")),
+            };
+            
+            // Detailed connection information for NAT traversal
+            let req_addr = req_client.public_addr;
+            let target_addr = target_client.public_addr;
+            
+            // Send connection request to target client
+            if let Err(e) = target_client.control_sender.send(NatMessage::ConnectionRequest {
                 client_id: client_id.to_string(),
-                public_addr: clients.get(client_id)
-                    .map(|info| info.public_addr)
-                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+                addr: req_addr,
+                nat_type: NatTraversalType::HolePunch, // Start with hole punch
             }).await {
-                error!("Failed to send connect notification to {}: {}", target_id, e);
-                return Err(anyhow!("Failed to notify target client"));
+                error!("Failed to send connection request to target: {}", e);
+                return Err(anyhow!("Failed to send connection request"));
             }
             
-            info!("Connection facilitated between {} and {}", client_id, target_id);
+            // Send target information to requester
+            if let Err(e) = control_sender.send(NatMessage::ConnectionInfo {
+                target_id: target_id.to_string(),
+                addr: target_addr,
+                nat_type: NatTraversalType::HolePunch, // Start with hole punch
+                predicted_ports: Self::predict_nat_ports(target_addr.port()), // Add port prediction for symmetric NATs
+            }).await {
+                error!("Failed to send target info to requester: {}", e);
+                return Err(anyhow!("Failed to send target info"));
+            }
+            
+            Ok(())
         } else {
             // Target client not found
-            warn!("Connect request for unknown client: {}", target_id);
-            control_sender.send(NatMessage::Error {
-                message: format!("Target client {} not found", target_id),
-            }).await?;
+            debug!("Target client {} not found", target_id);
+            if let Err(e) = control_sender.send(NatMessage::TargetNotFound {
+                target_id: target_id.to_string(),
+            }).await {
+                error!("Failed to send target not found message: {}", e);
+            }
+            Err(anyhow!("Target client not found"))
+        }
+    }
+    
+    // Predict possible NAT ports for symmetric NATs
+    // Returns a list of likely port numbers the NAT might use
+    fn predict_nat_ports(base_port: u16) -> Vec<u16> {
+        let mut predicted_ports = Vec::with_capacity(MAX_PORT_PREDICTION_RANGE as usize * 2 + 3);
+        
+        // Add the known port
+        predicted_ports.push(base_port);
+        
+        // Common port allocation strategies:
+        // 1. Sequential allocation (most common)
+        for i in 1..MAX_PORT_PREDICTION_RANGE {
+            predicted_ports.push(base_port.wrapping_add(i));
         }
         
-        Ok(())
+        // Some NATs skip over even/odd ports or use specific increments
+        for i in 1..5 {
+            predicted_ports.push(base_port.wrapping_add(i * 2)); // even increment
+            predicted_ports.push(base_port.wrapping_add(i * 2 + 1)); // odd increment
+        }
+        
+        // Some NATs decrement instead
+        for i in 1..5 {
+            predicted_ports.push(base_port.wrapping_sub(i));
+        }
+        
+        // 2. Port preservation with fallback
+        // Some NATs try to preserve the same port number across mappings
+        let preserved_port = base_port;
+        if !predicted_ports.contains(&preserved_port) {
+            predicted_ports.push(preserved_port);
+        }
+        
+        // Remove duplicates and sort for more efficient connection attempts
+        predicted_ports.sort_unstable();
+        predicted_ports.dedup();
+        
+        predicted_ports
     }
     
     // Handle a relay request for direct data forwarding
@@ -504,5 +725,86 @@ impl RelayServer {
         }
         
         Ok(())
+    }
+    
+    // Detect the NAT type of a client
+    async fn detect_nat_type(&self, client_id: &str, public_addr: SocketAddr, control_sender: mpsc::Sender<NatMessage>) -> Result<()> {
+        debug!("Detecting NAT type for client {}", client_id);
+        
+        // In a real implementation, we would do multiple tests to determine NAT type
+        // For now, we use a simplified detection method based on the available information
+        
+        // Get the client's registered data
+        let clients = self.clients.lock().await;
+        let client_info = match clients.get(client_id) {
+            Some(info) => info,
+            None => return Err(anyhow!("Client not found")),
+        };
+        
+        // Determine NAT type
+        // For a real implementation, we would:
+        // 1. Send binding requests from different IPs and ports to detect mapping behavior
+        // 2. Check if client can receive unsolicited packets
+        // 3. Test for hairpin translation
+        
+        // For this simplified implementation, we'll just assume common NAT types based on pattern
+        let nat_type = if let Some(ref server_ip) = self.public_ip {
+            if public_addr.ip().to_string() == *server_ip {
+                // Client IP is the same as server's public IP
+                // Likely to be Open Internet or Full Cone NAT
+                if public_addr.port() < 1024 {
+                    // Low ports are often directly mapped, indicating Open Internet
+                    NatType::OpenInternet
+                } else {
+                    // Higher ports often indicate NAT, but with good mapping
+                    NatType::FullCone
+                }
+            } else if public_addr.ip().is_loopback() || is_private_ip(&public_addr.ip()) {
+                // Client appears to be in a private network
+                // Most likely a Symmetric NAT
+                NatType::SymmetricNat
+            } else {
+                // Default to the most common NAT type (Port Restricted Cone)
+                NatType::PortRestrictedCone
+            }
+        } else {
+            // Without server's public IP, we can't make good guesses
+            NatType::Unknown
+        };
+        
+        debug!("Detected NAT type for client {}: {:?}", client_id, nat_type);
+        
+        // Send the detected NAT type to the client
+        if let Err(e) = control_sender.send(NatMessage::NatTypeDetected { nat_type }).await {
+            error!("Failed to send NAT type to client {}: {}", client_id, e);
+            return Err(anyhow!("Failed to send NAT type"));
+        }
+        
+        Ok(())
+    }
+}
+
+// Utility function to check if an IP address is private
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            // Check RFC1918 private ranges
+            ip.octets()[0] == 10 || // 10.0.0.0/8
+            (ip.octets()[0] == 172 && (ip.octets()[1] >= 16 && ip.octets()[1] <= 31)) || // 172.16.0.0/12
+            (ip.octets()[0] == 192 && ip.octets()[1] == 168) || // 192.168.0.0/16
+            // Check other special-use IPv4 addresses
+            (ip.octets()[0] == 169 && ip.octets()[1] == 254) || // 169.254.0.0/16 link-local
+            ip.octets()[0] == 127 // 127.0.0.0/8 loopback
+        },
+        IpAddr::V6(ip) => {
+            // IPv6 private addresses
+            ip.is_unspecified() || 
+            ip.is_loopback() || 
+            ip.is_unicast_link_local() || 
+            ip.is_unique_local() || 
+            // The is_unicast_site_local method is deprecated
+            // Instead check for prefix fc00::/7 which is used for unique local addresses
+            (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
     }
 } 

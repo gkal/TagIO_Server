@@ -87,10 +87,11 @@ impl RelayServer {
         let ports_to_try = if is_render {
             if let Some(port) = &fixed_port {
                 // On Render.com, use the assigned port first, then try fallbacks
-                vec![port.clone(), "443".to_string(), "80".to_string(), "10000".to_string(), "3000".to_string(), "8080".to_string()]
+                // Note: Prioritize non-privileged ports that are commonly allowed in cloud environments
+                vec![port.clone(), "10000".to_string(), "8080".to_string(), "3000".to_string(), "443".to_string(), "80".to_string()]
             } else {
-                // Standard cloud ports if no PORT env var
-                vec!["443".to_string(), "80".to_string(), "10000".to_string(), "3000".to_string(), "8080".to_string()]
+                // Standard cloud ports if no PORT env var, prioritizing non-privileged ports
+                vec!["10000".to_string(), "8080".to_string(), "3000".to_string(), "443".to_string(), "80".to_string()]
             }
         } else {
             // For local development, try these ports
@@ -1050,66 +1051,78 @@ fn prompt_input(prompt: &str) -> String {
 
 // Helper function to detect public IP
 async fn detect_public_ip() -> Result<String> {
-    // Use a simple HTTP service to detect public IP
-    println!("Detecting public IP address...");
+    // Use multiple IP detection services for redundancy
+    println!("Attempting to detect public IP address...");
     
-    // Try to detect via multiple services
+    // Services to try in order
     let services = [
         "https://api.ipify.org", 
         "https://ifconfig.me/ip", 
         "https://ipecho.net/plain",
-        "https://checkip.amazonaws.com"
+        "https://checkip.amazonaws.com",
+        "https://icanhazip.com",
+        "https://wtfismyip.com/text"
     ];
     
-    // Check if we're on render.com
+    // Check if we're on render.com for better error messages
     let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
     
-    if is_render {
-        println!("Detected Render.com environment, attempting to determine outbound IP...");
+    // Create a reqwest client with timeout and headers for better success rate
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 TagIO-Relay-Server/0.1.9")
+        .build()
+        .unwrap_or_default();
+    
+    // Try each service with exponential backoff
+    for (attempt, service_url) in services.iter().enumerate() {
+        println!("Trying to determine public IP using: {}", service_url);
         
-        // Create a reqwest client with timeout
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        
-        // Try to connect to external services to determine our outbound IP
-        for service_url in &services {
-            println!("Trying to determine public IP using: {}", service_url);
-            
-            match client.get(*service_url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        match response.text().await {
-                            Ok(ip) => {
-                                let ip = ip.trim();
-                                if !ip.is_empty() && ip.chars().all(|c| c.is_digit(10) || c == '.') {
-                                    println!("Successfully detected Render outbound IP: {}", ip);
-                                    println!("This is the static outbound IP for your Render region");
-                                    println!("NAT traversal will use this IP for optimal performance");
-                                    return Ok(ip.to_string());
-                                } else {
-                                    println!("Service returned invalid IP format: '{}'", ip);
-                                }
-                            },
-                            Err(e) => println!("Failed to read response from {}: {}", service_url, e)
-                        }
-                    } else {
-                        println!("Service {} returned error status: {}", service_url, response.status());
-                    }
-                },
-                Err(e) => println!("Failed to connect to {}: {}", service_url, e)
-            }
+        // Exponential backoff between attempts
+        if attempt > 0 {
+            let backoff_ms = std::cmp::min(100 * (1 << attempt), 2000); // Max 2 seconds
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
         
-        // If all services failed, suggest manual configuration
+        match client.get(*service_url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.text().await {
+                        Ok(ip) => {
+                            let ip = ip.trim();
+                            // Validate that the response is actually an IP address
+                            if !ip.is_empty() && ip.chars().all(|c| c.is_digit(10) || c == '.' || c == ':') {
+                                println!("Successfully detected public IP: {}", ip);
+                                
+                                if is_render {
+                                    println!("This is the outbound IP for your service instance");
+                                    println!("NAT traversal will use this IP for optimal performance");
+                                }
+                                
+                                return Ok(ip.to_string());
+                            } else {
+                                println!("Service returned invalid IP format: '{}'", ip);
+                            }
+                        },
+                        Err(e) => println!("Failed to read response from {}: {}", service_url, e)
+                    }
+                } else {
+                    println!("Service {} returned error status: {}", service_url, response.status());
+                }
+            },
+            Err(e) => println!("Failed to connect to {}: {}", service_url, e)
+        }
+    }
+    
+    // If all services failed, provide helpful guidance
+    if is_render {
         println!("Could not auto-detect Render.com outbound IP address.");
-        println!("You can manually set the PUBLIC_IP environment variable in the Render dashboard.");
+        println!("You should manually set the PUBLIC_IP environment variable in the Render dashboard.");
         println!("Find your static outbound IP in the Render dashboard under Connect > Outbound.");
-        println!("This is important for optimal NAT traversal between clients.");
     } else {
-        println!("Not running on Render.com, auto-detection might not be accurate.");
+        println!("Could not auto-detect public IP address from any service.");
         println!("For production, please manually set the PUBLIC_IP environment variable.");
+        println!("You can manually find your IP by visiting https://whatismyip.com in a browser.");
     }
     
     Err(anyhow!("Could not auto-detect public IP address"))
@@ -1156,16 +1169,16 @@ fn is_potential_problematic_region(ip: &str) -> bool {
 async fn start_health_check_server() {
     let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
     
-    // Try multiple ports that Render might check
+    // Try multiple ports that are commonly scanned
     let health_check_ports = if is_render {
-        vec!["3000", "10000", "8080", "80"]
+        vec!["10000", "8080", "3000", "80"]
     } else {
         vec!["8080"]
     };
     
     let mut success = false;
     
-    for port in health_check_ports {
+    for port in &health_check_ports {
         let addr = format!("0.0.0.0:{}", port);
         println!("Attempting to start health check server on {}", addr);
         
@@ -1174,6 +1187,7 @@ async fn start_health_check_server() {
                 println!("SUCCESS: Health check server listening on {}", addr);
                 
                 // Spawn a task to handle health check requests
+                let port_clone = port.to_string();
                 tokio::spawn(async move {
                     println!("Health check server active on {}", addr);
                     
@@ -1182,18 +1196,24 @@ async fn start_health_check_server() {
                             Ok((mut socket, addr)) => {
                                 println!("Health check request from {}", addr);
                                 
-                                // Create a more robust HTTP response that is more likely to be detected
-                                let response = concat!(
-                                    "HTTP/1.1 200 OK\r\n",
-                                    "Server: TagIO-Relay\r\n",
-                                    "Content-Type: text/plain\r\n",
-                                    "Connection: keep-alive\r\n",
-                                    "Content-Length: 22\r\n",
-                                    "\r\n",
-                                    "TagIO Relay Server Ready"
+                                // Read the request to identify it but don't wait too long
+                                let mut buf = vec![0; 1024];
+                                let _ = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut buf)).await;
+                                
+                                // Create a more robust HTTP response with headers that confirm it's an HTTP server
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Server: TagIO-Relay/0.1.9\r\n\
+                                     Content-Type: text/plain\r\n\
+                                     Connection: keep-alive\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     X-Health-Check: true\r\n\
+                                     Content-Length: 28\r\n\
+                                     \r\n\
+                                     TagIO Relay Server Ready on {}", port_clone
                                 );
                                 
-                                // Send the response immediately without waiting for request parsing
+                                // Send the response immediately 
                                 match socket.write_all(response.as_bytes()).await {
                                     Ok(_) => {
                                         println!("Health check response sent to {}", addr);
@@ -1219,8 +1239,11 @@ async fn start_health_check_server() {
                 success = true;
                 println!("Health check server successfully started on port {}", port);
                 
-                // Don't immediately return - try to bind to multiple ports
-                // This increases chances of Render.com's port scan finding our service
+                // For render.com, we need to make sure the first health check server succeeds
+                // so the instance doesn't get shut down, but we should try other ports too
+                if is_render && port == "80" {
+                    break;
+                }
             },
             Err(e) => {
                 println!("Failed to bind health check server to {}: {}", addr, e);
@@ -1270,67 +1293,20 @@ async fn main() -> Result<()> {
     
     // IMPORTANT: Start health check server FIRST
     // This ensures Render.com can detect our service quickly
-    println!("Starting health check server for Render.com port detection...");
+    println!("Starting health check server for port detection...");
     start_health_check_server().await;
     
     // If running on render.com, wait a bit to ensure the health check is detected
     if is_render {
-        println!("Waiting for health check server to be detected by Render.com...");
+        println!("Waiting for health check server to be detected...");
         tokio::time::sleep(Duration::from_secs(2)).await;
         println!("Continuing with main server initialization");
     }
     
-    // Get public IP from environment variable or auto-detect
-    let mut public_ip = env::var("PUBLIC_IP").ok();
-    
-    // If no PUBLIC_IP is set and we're on render.com, try to auto-detect
-    if public_ip.is_none() && is_render {
-        println!("No PUBLIC_IP environment variable set but running on Render.com");
-        println!("Attempting to auto-detect the Render.com outbound IP...");
-        
-        match detect_public_ip().await {
-            Ok(ip) => {
-                println!("Successfully auto-detected Render.com outbound IP: {}", ip);
-                println!("Using this IP for optimal NAT traversal");
-                public_ip = Some(ip);
-            }
-            Err(e) => {
-                println!("Failed to auto-detect outbound IP: {}", e);
-                println!("NAT traversal may not work optimally.");
-                println!("For best results, set the PUBLIC_IP environment variable in the Render dashboard.");
-            }
-        }
-    } else if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) && !is_render {
-        // Only prompt in local/development environment, not on Render
-        let auto_detect = prompt_yes_no("Do you want to auto-detect your public IP? (y/n)");
-        if auto_detect {
-            match detect_public_ip().await {
-                Ok(ip) => {
-                    println!("Auto-detected public IP: {}", ip);
-                    public_ip = Some(ip);
-                }
-                Err(e) => {
-                    eprintln!("Failed to auto-detect public IP: {}", e);
-                    let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
-                    if !manual_ip.is_empty() {
-                        public_ip = Some(manual_ip);
-                    }
-                }
-            }
-        } else {
-            let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
-            if !manual_ip.is_empty() {
-                public_ip = Some(manual_ip);
-            }
-        }
-    }
-    
-    if let Some(ip) = &public_ip {
-        println!("Using public IP address: {}", ip);
-    } else {
-        println!("No public IP specified, using client-perceived addresses");
-    }
-    
+    // Use the known public IP address for the cloud server
+    let public_ip = Some("18.156.158.53".to_string());
+    println!("Using known public IP: {}", public_ip.as_ref().unwrap());
+
     // Get auth secret from environment variable or use default
     let auth_secret = env::var("AUTH_SECRET").ok();
     
