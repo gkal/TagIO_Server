@@ -25,6 +25,10 @@ const READ_BUFFER_SIZE: usize = 8192;
 // Health check server ports
 const HEALTH_CHECK_PORTS: [u16; 3] = [8888, 8080, 3000];
 
+// Add allow attribute to silence the warning
+#[allow(dead_code)]
+const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
+
 // Information about a connected client
 struct ClientInfo {
     public_addr: SocketAddr,
@@ -385,20 +389,12 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
             })
         };
         
-        // Send version check message immediately upon connection
-        if let Err(e) = control_tx.send(NatMessage::VersionCheck { version: PROTOCOL_VERSION }).await {
-            if !is_local {
-                println!("===== ERROR: Failed to send version check to {} =====", addr);
-                error!("Failed to send version check to {}: {}", addr, e);
-            }
-            return Err(anyhow!("Failed to send version check"));
-        }
-        
         // Buffer for incoming data
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut client_id = String::new();
         let mut authenticated = false;
         let mut _version_checked = false;
+        let mut protocol_verified = false; // Add flag to track if protocol has been verified
         
         if !is_local {
             info!("PROTOCOL CHECK: Waiting for client {} to identify protocol", addr);
@@ -432,30 +428,11 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
                         buffer.starts_with(b"OPTIONS ")
                     ) {
                         if !is_local {
-                            info!("PROTOCOL DETECTED: HTTP client from {}, sending health response", addr);
+                            info!("PROTOCOL DETECTED: HTTP client from {}, immediately dropping connection", addr);
+                            println!("===== DROPPED: HTTP client connection from {} =====", addr);
                         }
                         
-                        // Provide a more helpful error message for HTTP clients
-                        let response_body = "TagIO Relay Server v0.2.1 (Error: HTTP protocol detected)\r\n\r\n";
-                        let response_body = format!("{}\r\nThis is a TagIO relay server that requires the TagIO protocol.\r\n\
-                                                    If you're trying to connect with a TagIO client, make sure to:\r\n\
-                                                    1. Connect to tagio.onrender.com:443 (not port 10000)\r\n\
-                                                    2. Use the TagIO native protocol (not HTTP)\r\n\
-                                                    3. Use the correct authentication token\r\n\
-                                                    \r\n\
-                                                    Ports 80/443 can be used for TagIO protocol connections through Render's proxy.", response_body);
-                        
-                        let response = format!("HTTP/1.1 400 Bad Request\r\n\
-                                               Content-Type: text/plain\r\n\
-                                               Content-Length: {}\r\n\
-                                               Connection: close\r\n\
-                                               \r\n\
-                                               {}", response_body.len(), response_body);
-                        if let Err(e) = http_tx.send(response).await {
-                            if !is_local {
-                                error!("Failed to send HTTP response: {}", e);
-                            }
-                        }
+                        // Immediately drop HTTP connections without sending any response
                         break;
                     }
 
@@ -497,6 +474,20 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
                         
                         if !is_local {
                             println!("===== PROTOCOL: Valid TagIO message detected from {} =====", addr);
+                        }
+                        
+                        // If this is the first valid TagIO message we've received, send version check
+                        if !protocol_verified {
+                            protocol_verified = true;
+                            
+                            // Now that we've verified it's a TagIO client, send version check
+                            if let Err(e) = control_tx.send(NatMessage::VersionCheck { version: PROTOCOL_VERSION }).await {
+                                if !is_local {
+                                    println!("===== ERROR: Failed to send version check to {} =====", addr);
+                                    error!("Failed to send version check to {}: {}", addr, e);
+                                }
+                                break;
+                            }
                         }
                         
                         // Handle the message contents after magic bytes
@@ -1086,4 +1077,18 @@ fn is_localhost(addr: &SocketAddr) -> bool {
         IpAddr::V4(ip) => ip.is_loopback() || ip.octets()[0] == 127,
         IpAddr::V6(ip) => ip.is_loopback()
     }
+}
+
+// Helper function to detect HTTP protocol
+fn is_http_protocol(data: &[u8]) -> bool {
+    // Check for common HTTP request methods
+    if data.len() < 4 {
+        return false;
+    }
+    
+    data.starts_with(b"GET ") || 
+    data.starts_with(b"POST") || 
+    data.starts_with(b"HEAD") || 
+    data.starts_with(b"PUT ") || 
+    data.starts_with(b"HTTP")
 } 
