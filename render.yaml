@@ -5,7 +5,7 @@ services:
     region: ohio
     plan: free
     branch: main
-    buildCommand: RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --bin tagio_relay_server --no-default-features --features server
+    buildCommand: ATK_NO_PKG_CONFIG=1 GTK_NO_PKG_CONFIG=1 GDK_NO_PKG_CONFIG=1 PANGO_NO_PKG_CONFIG=1 CAIRO_NO_PKG_CONFIG=1 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --bin tagio_relay_server --no-default-features --features server
     startCommand: ./target/release/tagio_relay_server
     envVars:
       - key: PUBLIC_IP
@@ -16,4 +16,14 @@ services:
         value: tagio_default_secret # Change this for production use
       - key: CARGO_ENCODED_RUSTFLAGS
         value: "-C target-feature=+crt-static"
+      - key: ATK_NO_PKG_CONFIG
+        value: "1"
+      - key: GTK_NO_PKG_CONFIG
+        value: "1"
+      - key: GDK_NO_PKG_CONFIG
+        value: "1"
+      - key: PANGO_NO_PKG_CONFIG
+        value: "1"
+      - key: CAIRO_NO_PKG_CONFIG
+        value: "1"
     healthCheckPath: /health 

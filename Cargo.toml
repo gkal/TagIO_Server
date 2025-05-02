@@ -120,4 +120,14 @@ incremental = true
 # Optimize dependencies even in debug builds
 [profile.dev.package."*"]
 opt-level = 1
-debug = false 
+debug = false
+
+# Add a patch section at the end of the file
+[patch.crates-io]
+# These patches will be applied when building with the server feature only
+# They create empty implementations to avoid GTK/ATK dependencies
+atk-sys = { path = "./atk-sys-dummy" }
+gtk-sys = { path = "./gtk-sys-dummy" }
+gdk-sys = { path = "./gdk-sys-dummy" }
+pango-sys = { path = "./pango-sys-dummy" }
+cairo-sys-rs = { path = "./cairo-sys-rs-dummy" } 

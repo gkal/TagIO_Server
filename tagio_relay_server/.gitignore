@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+
+# Rustfmt backup files
+**/*.rs.bk
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Executable files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Log files
+*.log
+
+# Environment files
+.env
+.env.local 

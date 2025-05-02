@@ -1,0 +1,18 @@
+[package]
+name = "cairo-sys-rs"
+version = "0.18.2"
+edition = "2021"
+description = "Dummy implementation of cairo-sys-rs for server builds"
+license = "MIT"
+
+[lib]
+name = "cairo_sys"
+path = "src/lib.rs"
+
+# Define features to satisfy dependencies
+[features]
+v1_16 = []
+dox = []
+
+# Empty dependencies - we're not actually using any external crates
+[dependencies] 
