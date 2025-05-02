@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment files
+.env
+.env.local
+
+# Backup files
+*~
+*.bak
+
+# Dependency lock files (keeping these is usually good practice)
+# Cargo.lock
+
+# Debug artifacts
+*.pdb
+
+# Binary files
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Generated documentation
+/doc/
