@@ -187,10 +187,10 @@ impl RelayServer {
                                                 // Simple HTTP server that responds to any request with 200 OK
                                                 let response = "HTTP/1.1 200 OK\r\n\
                                                                Content-Type: text/plain\r\n\
-                                                               Content-Length: 19\r\n\
+                                                               Content-Length: 36\r\n\
                                                                Connection: close\r\n\
                                                                \r\n\
-                                                               TagIO Server Healthy";
+                                                               TagIO Relay Server Healthy (Render)";
                                                 
                                                 if let Err(e) = socket.write_all(response.as_bytes()).await {
                                                     error!("Failed to send health check response: {}", e);
@@ -331,9 +331,23 @@ impl RelayServer {
                 },
                 Ok(Ok(n)) => {
                     // Check for HTTP request (clients sometimes try HTTP first)
-                    if !authenticated && buffer.starts_with(b"GET ") || buffer.starts_with(b"POST ") || buffer.starts_with(b"HTTP") {
-                        debug!("Received HTTP request from {}, sending health response", addr);
-                        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 27\r\n\r\nTagIO NAT Traversal Server OK";
+                    if !authenticated && (
+                        buffer.starts_with(b"GET ") || 
+                        buffer.starts_with(b"POST ") || 
+                        buffer.starts_with(b"HTTP") ||
+                        // Also detect other common HTTP methods
+                        buffer.starts_with(b"HEAD ") ||
+                        buffer.starts_with(b"PUT ") ||
+                        buffer.starts_with(b"DELETE ") ||
+                        buffer.starts_with(b"OPTIONS ")
+                    ) {
+                        info!("Received HTTP request from {}, sending health response", addr);
+                        let response = "HTTP/1.1 200 OK\r\n\
+                                       Content-Type: text/plain\r\n\
+                                       Content-Length: 36\r\n\
+                                       Connection: close\r\n\
+                                       \r\n\
+                                       TagIO Relay Server Healthy (Render)";
                         if let Err(e) = http_tx.send(response.to_string()).await {
                             error!("Failed to send HTTP response: {}", e);
                         }
@@ -342,7 +356,26 @@ impl RelayServer {
                     
                     // Verify magic bytes for the TagIO protocol
                     if n < PROTOCOL_MAGIC.len() || &buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
-                        warn!("Invalid protocol magic bytes from {}", addr);
+                        // This is normal for health check systems - log at debug level for automated checks
+                        if addr.ip().is_loopback() {
+                            debug!("Connection from localhost ({}) with non-TagIO protocol", addr);
+                        } else {
+                            // For non-localhost, still warn as it could be an actual issue
+                            warn!("Invalid protocol magic bytes from {}", addr);
+                        }
+                        
+                        // Try to send a response anyway if it looks like a valid connection
+                        if n > 0 {
+                            let response = "HTTP/1.1 400 Bad Request\r\n\
+                                           Content-Type: text/plain\r\n\
+                                           Content-Length: 59\r\n\
+                                           \r\n\
+                                           Invalid protocol: TagIO Relay Server requires TagIO protocol";
+                            
+                            if let Err(e) = http_tx.send(response.to_string()).await {
+                                debug!("Failed to send protocol error response: {}", e);
+                            }
+                        }
                         break;
                     }
                     
