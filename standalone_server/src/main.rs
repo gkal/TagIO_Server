@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     
     // Define preferred ports for binding in order of preference
     // Non-privileged ports first, then fallback to privileged ones if running with sufficient permissions
-    let preferred_ports = [10000, 8080, 3000, 443, 80];
+    let _preferred_ports = [10000, 8080, 3000, 443, 80];
     
     // In a cloud environment, prioritize the PORT environment variable if available
     if is_cloud && cloud_port.is_some() {
