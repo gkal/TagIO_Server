@@ -26,7 +26,7 @@ pub const MAX_MESSAGE_SIZE: usize = 65536; // 64KB
 
 // Cloud server address for clients to connect to
 #[allow(dead_code)]
-pub const DEFAULT_RELAY_SERVER: &str = "tagio-server.onrender.com:443";
+pub const DEFAULT_RELAY_SERVER: &str = "tagio-server.onrender.com:10000";
 
 // Protocol magic bytes for identifying valid TagIO traffic
 // "TAGIO" in ASCII bytes

@@ -1,7 +1,7 @@
 //! Constants for the relay module
 
 // Default relay server address - prefer connecting via HTTPS port for better firewall traversal
-pub const DEFAULT_RELAY_SERVER: &str = "tagio.onrender.com:443";
+pub const DEFAULT_RELAY_SERVER: &str = "tagio.onrender.com:10000";
 
 // Alternative port to try if main port is blocked
 pub const RELAY_SERVICE_ALT_PORT: u16 = 80;
