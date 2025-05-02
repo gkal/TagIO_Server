@@ -1,407 +1,175 @@
-mod screen_capture;
-mod streaming;
-mod input;
-mod network_speed;
-mod config;
-mod relay;
+// Server-only binary for TagIO relay server
+// This file should not import any GUI dependencies
+#![cfg(feature = "server")]
 
-// Import VERSION from lib.rs instead of defining it here
-use tagio::VERSION;
-use tagio::gui;
-use anyhow::{Result, anyhow};
+use std::env;
+use std::net::IpAddr;
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::timeout;
-use rfd::MessageDialog;
-use log::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use anyhow::{Result, anyhow};
+use log::info;
+use clap::{Parser, ArgAction};
 
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:443";
-const DEFAULT_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
+mod constants;
+mod messages;
+mod server;
 
-// Client information stored in the server
-struct ClientInfo {
-    _public_addr: SocketAddr,
-    _sender: mpsc::Sender<Vec<u8>>,
-}
+use constants::DEFAULT_BIND_ADDRESS;
+use server::RelayServer;
 
-// Message types for relay protocol
-#[derive(Debug, Serialize, Deserialize, Clone)]
-enum RelayMessage {
-    // Registration messages
-    Register { client_id: String },
-    RegisterAck { public_addr: SocketAddr },
+/// TagIO Relay Server - NAT traversal and relay server for TagIO remote desktop
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about=None)]
+struct CliArgs {
+    /// Bind address for the server (default: 0.0.0.0:443)
+    #[clap(short, long, value_name = "ADDRESS:PORT")]
+    bind: Option<String>,
     
-    // Connection establishment
-    ConnectRequest { target_id: String },
-    ConnectionInfo { 
-        client_id: String, 
-        public_addr: SocketAddr, 
-        private_addrs: Vec<SocketAddr> 
-    },
-    
-    // Relay functionality
-    RelayRequest { session_id: String },
-    RelayAccept { session_id: String },
-    RelayData { session_id: String, data: Vec<u8> },
-    
-    // Keep-alive
-    Ping,
-    Pong,
-}
-
-// Main relay server implementation
-struct RelayServer {
-    clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
+    /// Public IP address of the server (used for NAT traversal)
+    #[clap(short, long, value_name = "IP")]
     public_ip: Option<String>,
+    
+    /// Authentication secret for client connections
+    #[clap(short, long, value_name = "SECRET")]
+    auth: Option<String>,
+
+    /// Enable verbose logging
+    #[clap(short, long, action = ArgAction::SetTrue)]
+    verbose: bool,
+    
+    /// Run interactively (prompt for configuration)
+    #[clap(short, long, action = ArgAction::SetTrue)]
+    interactive: bool,
 }
 
-impl RelayServer {
-    // Initialize a new relay server
-    fn new(public_ip: Option<String>) -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            public_ip,
-        }
-    }
+/// Prompt for user input with a given message
+fn prompt_input(prompt: &str) -> String {
+    print!("{}: ", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    input.trim().to_string()
+}
+
+/// Attempt to detect the public IP address
+async fn detect_public_ip() -> Result<String> {
+    // Try to get the public IP from an external service
+    let public_ip = match tokio::task::spawn_blocking(|| {
+        ureq::get("https://api.ipify.org")
+            .call()
+            .map(|res| res.into_string().unwrap_or_default())
+    }).await {
+        Ok(Ok(ip)) if !ip.is_empty() => ip,
+        _ => return Err(anyhow!("Failed to detect public IP"))
+    };
     
-    // Main server loop
-    async fn run(&self, bind_addr: &str) -> io::Result<()> {
-        let listener = TcpListener::bind(bind_addr).await?;
-        info!("Relay server listening on {}", bind_addr);
-        
-        if let Some(public_ip) = &self.public_ip {
-            info!("Server configured with public IP: {}", public_ip);
-        } else {
-            warn!("No public IP configured. NAT traversal may not work optimally.");
-            warn!("Server will attempt to auto-detect public IP or use client's perceived address.");
-        }
-        
-        loop {
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    info!("New connection from {}", addr);
-                    
-                    // Determine the public address to use for this client
-                    let public_addr = if let Some(ip) = &self.public_ip {
-                        match ip.parse::<IpAddr>() {
-                            Ok(public_ip) => SocketAddr::new(public_ip, addr.port()),
-                            Err(_) => {
-                                warn!("Failed to parse configured public IP. Using detected IP.");
-                                addr
-                            }
-                        }
-                    } else {
-                        addr
-                    };
-                    
-                    // Clone shared state for this client's task
-                    let clients_clone = self.clients.clone();
-                    
-                    // Handle each client in a separate task
-                    tokio::spawn(async move {
-                        if let Err(e) = Self::handle_client(socket, addr, public_addr, clients_clone).await {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                }
-            }
-        }
-    }
-    
-    // Handle a client connection
-    async fn handle_client(
-        socket: TcpStream,
-        addr: SocketAddr,
-        public_addr: SocketAddr,
-        clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
-    ) -> Result<()> {
-        debug!("Handling new client connection from {}", addr);
-        
-        // Create channel for sending messages to client
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
-        
-        // Split the socket for concurrent reading and writing
-        let (mut read, mut write) = tokio::io::split(socket);
-        
-        // Spawn a task to handle messages sent to the client
-        let write_task = tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if let Err(e) = write.write_all(&message).await {
-                    error!("Error writing to client {}: {}", addr, e);
-                    break;
-                }
-            }
-            debug!("Client sender task for {} terminated", addr);
-        });
-        
-        // Buffer for incoming messages
-        let mut buffer = [0u8; 4096];
-        let mut client_id = String::new();
-        
-        // Read and process client messages
-        loop {
-            // Set a timeout for reading from the client
-            match timeout(KEEP_ALIVE_TIMEOUT, read.read(&mut buffer)).await {
-                Ok(Ok(0)) => {
-                    // Connection closed
-                    debug!("Client {} disconnected", addr);
-                    break;
-                },
-                Ok(Ok(n)) => {
-                    // Process the message
-                    if let Ok(message) = bincode::deserialize::<RelayMessage>(&buffer[..n]) {
-                        debug!("Received message from {}: {:?}", addr, message);
-                        
-                        // Process registration first
-                        if let RelayMessage::Register { client_id: id } = &message {
-                            client_id = id.clone();
-                            
-                            // Store client info
-                            let mut clients_lock = clients.lock().await;
-                            clients_lock.insert(id.clone(), ClientInfo {
-                                _public_addr: public_addr,
-                                _sender: tx.clone(),
-                            });
-                            
-                            // Send acknowledgment with public address
-                            if let Ok(ack) = bincode::serialize(&RelayMessage::RegisterAck { 
-                                public_addr 
-                            }) {
-                                // Check if write task is still running before sending
-                                if !write_task.is_finished() {
-                                    if let Err(e) = tx.send(ack).await {
-                                        error!("Failed to send ack to {}: {}", addr, e);
-                                    }
-                                }
-                            }
-                            
-                            debug!("Client {} registered with ID {}", addr, id);
-                        }
-                        
-                        // Handle other message types
-                        // This is a simplified implementation - you'd handle
-                        // connect requests, relay data, etc. here
-                    }
-                },
-                Ok(Err(e)) => {
-                    error!("Error reading from client {}: {}", addr, e);
-                    break;
-                },
-                Err(_) => {
-                    // Timeout occurred, client might be dead
-                    debug!("Timeout reading from client {}, closing connection", addr);
-                    break;
-                }
-            }
-        }
-        
-        // Remove client from active clients
-        if !client_id.is_empty() {
-            let mut clients_lock = clients.lock().await;
-            clients_lock.remove(&client_id);
-            debug!("Removed client {} with ID {}", addr, client_id);
-        }
-        
-        // Ensure write task is terminated
-        write_task.abort();
-        
-        Ok(())
+    // Validate that it's a valid IP address
+    match IpAddr::from_str(&public_ip) {
+        Ok(_) => Ok(public_ip),
+        Err(_) => Err(anyhow!("Invalid public IP: {}", public_ip))
     }
 }
 
+/// Prompt for yes/no confirmation
+fn prompt_yes_no(prompt: &str) -> bool {
+    loop {
+        print!("{} (y/n): ", prompt);
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            _ => println!("Please enter 'y' or 'n'"),
+        }
+    }
+}
+
+/// Main entry point
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with default level
-    env_logger::Builder::new()
-        .format_timestamp_millis()
-        .filter_level(DEFAULT_LOG_LEVEL)
-        .init();
+    // Parse command line arguments
+    let args = CliArgs::parse();
     
-    // Print banner
-    println!("TagIO NAT Traversal Relay Server v0.2.0");
-    println!("----------------------------------------");
-    
-    // Get the local IP address to display to the user
-    let local_ip = match local_ip_address::local_ip() {
-        Ok(ip) => ip.to_string(),
-        Err(_) => "unknown".to_string(),
-    };
-    
-    println!("Local IP address: {}", local_ip);
-    println!("Default binding to: {}", DEFAULT_BIND_ADDRESS);
-    println!("");
-    println!("Note: For optimal NAT traversal, configure your");
-    println!("      public IP in the server settings if needed.");
-    
-    // Create and run the relay server with no public IP configured by default
-    // Users will need to configure this in settings if needed
-    let server = RelayServer::new(None);
-    
-    info!("Starting relay server on {}", DEFAULT_BIND_ADDRESS);
-    if let Err(e) = server.run(DEFAULT_BIND_ADDRESS).await {
-        error!("Server error: {}", e);
-        return Err(anyhow!("Server error: {}", e));
+    // Configure logging
+    if args.verbose {
+        env::set_var("RUST_LOG", "info");
+    } else {
+        env::set_var("RUST_LOG", "warn");
     }
+    env_logger::init();
     
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn relay_mode(mut shutdown_rx: mpsc::Receiver<()>, config: config::Config) -> Result<()> {
-    let local_key = config.local_key.clone();
+    // Initialize variables with default values
+    let mut bind_addr = DEFAULT_BIND_ADDRESS.to_string();
+    let mut public_ip = None;
+    let mut auth_secret = None;
     
-    // Show connection dialog
-    print!("Enter the remote TagIO ID: ");
-    io::stdout().flush()?;
-    
-    let mut remote_key = String::new();
-    io::stdin().read_line(&mut remote_key)?;
-    let remote_key = remote_key.trim().to_string();
-    
-    if remote_key.is_empty() {
-        println!("Remote TagIO ID cannot be empty!");
-        return Ok(());
-    }
-    
-    // Compare keys to determine role
-    if remote_key == local_key {
-        println!("Error: Remote TagIO ID cannot be the same as your local TagIO ID!");
-        return Ok(());
-    }
-
-    // Connect to the relay server and request connection to the remote key
-    println!("Connecting to relay server ({}) and looking for {}", config.relay_server, remote_key);
-    let mut stream = match relay::connect_via_relay(&local_key, &remote_key, Some(config.relay_server.clone()), true).await {
-        Ok(stream) => {
-            println!("Connection request sent. Waiting for remote approval...");
-            stream
-        },
-        Err(e) => {
-            // Cannot establish relay connection
-            println!("Failed to establish connection through relay: {}", e);
-            println!("Starting listener mode with local TagIO ID: {}", local_key);
-            
-            // Start TCP listener and wait for incoming connections
-            let listen_port = config.port;
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", listen_port)).await?;
-            
-            println!("Waiting for connection... Share your TagIO ID with the person who needs to connect.");
-            
-            // Use select to handle either new connection or shutdown signal
-            let result = tokio::select! {
-                result = listener.accept() => Ok::<(TcpStream, SocketAddr), anyhow::Error>(result?),
-                _ = shutdown_rx.recv() => {
-                    println!("Shutting down listener...");
-                    return Ok(())
+    // If interactive mode is enabled, prompt for configuration
+    if args.interactive {
+        println!("=== TagIO Relay Server Interactive Setup ===");
+        
+        // Bind address
+        let input_bind = prompt_input("Enter bind address (default: 0.0.0.0:443)");
+        if !input_bind.is_empty() {
+            bind_addr = input_bind;
+        }
+        
+        // Public IP
+        let detect_ip = prompt_yes_no("Attempt to detect public IP?");
+        if detect_ip {
+            match detect_public_ip().await {
+                Ok(ip) => {
+                    println!("Detected public IP: {}", ip);
+                    if prompt_yes_no("Use this IP?") {
+                        public_ip = Some(ip);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to detect public IP: {}", e);
                 }
-            };
-            
-            if let Ok((socket, addr)) = result {
-                println!("Incoming connection from: {}", addr);
-                
-                // Show approval dialog
-                let dialog = MessageDialog::new()
-                    .set_title("Connection Request")
-                    .set_description(&format!("Allow connection from {}?", addr))
-                    .set_buttons(rfd::MessageButtons::YesNo);
-                
-                if dialog.show() == rfd::MessageDialogResult::Yes {
-                    println!("Connection accepted");
-                    socket
-                } else {
-                    println!("Connection rejected");
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
             }
         }
-    };
-    
-    // Wait for connection response or request
-    let mut buffer = [0u8; 1024];
-    let n = stream.read(&mut buffer).await?;
-    let response = String::from_utf8_lossy(&buffer[..n]);
-    
-    if response.starts_with("CONNECTION_REQUEST:") {
-        // We received a connection request - show approval dialog
-        let requester_id = response.trim_start_matches("CONNECTION_REQUEST:").trim();
         
-        let dialog = MessageDialog::new()
-            .set_title("Connection Request")
-            .set_description(&format!("Allow connection from TagIO ID: {}?", requester_id))
-            .set_buttons(rfd::MessageButtons::YesNo);
-        
-        if dialog.show() == rfd::MessageDialogResult::Yes {
-            println!("Connection accepted");
-            // Send approval
-            stream.write_all(b"APPROVE\n").await?;
-        } else {
-            println!("Connection rejected");
-            stream.write_all(b"REJECT\n").await?;
-            return Ok(());
+        if public_ip.is_none() {
+            let input_ip = prompt_input("Enter public IP (leave empty to skip)");
+            if !input_ip.is_empty() {
+                // Validate the IP
+                match IpAddr::from_str(&input_ip) {
+                    Ok(_) => public_ip = Some(input_ip),
+                    Err(_) => {
+                        eprintln!("Invalid IP address: {}", input_ip);
+                        return Err(anyhow!("Invalid IP address"));
+                    }
+                }
+            }
         }
         
-        // Wait for established response
-        let n = stream.read(&mut buffer).await?;
-        let response = String::from_utf8_lossy(&buffer[..n]);
-        
-        if !response.starts_with("ESTABLISHED") {
-            println!("Failed to establish connection: {}", response);
-            return Ok(());
+        // Authentication
+        if prompt_yes_no("Enable authentication?") {
+            let secret = prompt_input("Enter authentication secret");
+            if !secret.is_empty() {
+                auth_secret = Some(secret);
+            } else {
+                eprintln!("Empty secret not allowed for authentication");
+                return Err(anyhow!("Empty authentication secret"));
+            }
         }
-    } else if !response.starts_with("ESTABLISHED") {
-        // Unexpected response
-        println!("Unexpected response from relay server: {}", response);
-        return Ok(());
-    }
-    
-    println!("Connection established with remote TagIO ID: {}", remote_key);
-    
-    // Determine role based on key comparison
-    let client_mode = remote_key < local_key;
-    
-    if client_mode {
-        // We become the client (viewer)
-        println!("Running as client (remote ID: {} < local ID: {})", remote_key, local_key);
-        println!("You are VIEWER - Starting image streaming from {}", remote_key);
-        
-        // Set up GUI with the new create_gui_with_title function
-        let (frame_tx, app) = gui::create_gui_with_title(&format!("TagIO Client - Connected to {}", remote_key));
-        
-        // Update connection status
-        {
-            let mut app_lock = app.lock().unwrap();
-            app_lock.connection_status = format!("Connected to {}...", remote_key);
-        }
-        
-        println!("Starting remote desktop session as VIEWER - Receiving screen data...");
-        
-        // Start streaming client
-        streaming::run_client(stream, frame_tx).await?;
     } else {
-        // We become the server (host)
-        println!("Running as server (remote ID: {} > local ID: {})", remote_key, local_key);
-        println!("You are HOST - Your screen is being shared with {}", remote_key);
-        println!("Remote control session active as HOST - Your screen is being shared");
+        // Use command line arguments
+        if let Some(b) = args.bind {
+            bind_addr = b;
+        }
         
-        // Create a null channel (we don't need GUI updates on server)
-        let (frame_tx, _) = mpsc::channel::<(Vec<u8>, u32, u32)>(1);
-        
-        // Start streaming server
-        streaming::run_server(stream, frame_tx).await?;
+        public_ip = args.public_ip;
+        auth_secret = args.auth;
     }
+    
+    // Initialize the relay server
+    let server = RelayServer::new(public_ip, auth_secret);
+    
+    // Run the server
+    info!("Starting TagIO relay server...");
+    server.run(&bind_addr).await?;
     
     Ok(())
-}
+} 

@@ -1,76 +1,41 @@
 # TagIO Relay Server
 
-A standalone relay server for TagIO remote desktop application, providing NAT traversal and relay capabilities.
-
 ## Overview
+This is a standalone NAT traversal relay server for TagIO remote desktop applications. It facilitates connections between clients that are behind NAT/firewalls.
 
-The TagIO relay server allows TagIO clients to establish peer-to-peer connections even when behind NAT or firewalls. This standalone version contains only the server functionality, with no dependencies on the client/GUI code.
+## Server Configuration
 
-## Features
+### Default Server Address
+The server is configured to use the following default settings:
+- Bind address: `0.0.0.0:443` (listens on all interfaces, port 443)
+- Public server address: `tagio-server.onrender.com:443` (for clients to connect to)
 
-- **NAT Traversal**: Helps clients establish direct peer-to-peer connections
-- **Relay Capability**: Falls back to relaying data when direct connections aren't possible
-- **Authentication**: Optional client authentication for secure deployments
-- **Health Check Endpoint**: For monitoring server health
+**IMPORTANT NOTE:** The public server address has been updated from `tagio.onrender.com` to `tagio-server.onrender.com`. Client applications should be updated to use this new address.
 
-## Building
+### Authentication
+The server uses a default authentication secret (`tagio_default_secret`). For production use, it's recommended to change this using the `--auth` parameter.
 
-```bash
-cargo build --release
-```
-
-This will create the executable in the `target/release` directory.
-
-## Running
+## Running the Server
 
 ### Basic Usage
-
-```bash
-# Run with default settings (0.0.0.0:443)
-target/release/tagio_relay_server
-
-# Run with custom bind address
-target/release/tagio_relay_server --bind 0.0.0.0:8443
-
-# Run with explicit public IP (recommended for production)
-target/release/tagio_relay_server --public-ip 123.45.67.89
-
-# Run with authentication enabled
-target/release/tagio_relay_server --auth your_secret_here
-
-# Run with interactive setup
-target/release/tagio_relay_server --interactive
+```
+tagio_relay_server.exe
 ```
 
-### Command Line Options
-
-- `--bind`, `-b`: Bind address (default: 0.0.0.0:443)
-- `--public-ip`, `-p`: Public IP address for NAT traversal
-- `--auth`, `-a`: Authentication secret for client connections
-- `--verbose`, `-v`: Enable verbose logging
-- `--interactive`, `-i`: Run in interactive setup mode
-- `--help`, `-h`: Show help message
-
-## Deployment
-
-The server requires the following ports to be open:
-- Main service port (default: 443)
-- Health check port (8080)
-
-For optimal NAT traversal, the server should have a public IP address.
-
-## Docker
-
-You can build and run the server in Docker:
-
-```bash
-# Build the Docker image
-docker build -t tagio-relay-server .
-
-# Run the container
-docker run -p 443:443 -p 8080:8080 tagio-relay-server
+### With Custom Configuration
+```
+tagio_relay_server.exe --bind 0.0.0.0:443 --public-ip your.ip.address --auth your_secret
 ```
 
-## License
+### Interactive Mode
+```
+tagio_relay_server.exe --interactive
+```
 
-MIT License 
+## Client Integration
+Clients should be configured to connect to:
+```
+tagio-server.onrender.com:443
+```
+
+For client developers: Make sure to update your client code to use the new server address. The server is hosted on Render.com and provides NAT traversal capabilities for peer-to-peer connections. 

@@ -1,444 +1,412 @@
-use std::net::{SocketAddr, IpAddr};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
-use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
 use anyhow::{Result, anyhow};
-use log::{info, warn, error};
-
-use crate::constants::{
-    CONNECTION_TIMEOUT_SECS, 
-    HEALTH_CHECK_PORT,
-    MAX_ID_LENGTH,
-    MAX_AUTH_LENGTH
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
 };
-use crate::messages::MessageType;
+use log::{debug, error, info, warn, trace};
+use crate::messages::NatMessage;
+use crate::constants::DEFAULT_AUTH_SECRET;
 
-// Information about each connected client
+// Keep alive timeout
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
+// Buffer size for reading from clients
+const READ_BUFFER_SIZE: usize = 8192;
+// Maximum number of unauthorized attempts before logging a warning
+const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
+
+// Information about a connected client
 struct ClientInfo {
     public_addr: SocketAddr,
-    sender: mpsc::Sender<Vec<u8>>,
+    control_sender: mpsc::Sender<NatMessage>,
 }
 
-/// Main relay server implementation 
+// Relay session for direct data forwarding - only the data_sender is needed
+struct RelaySession {
+    data_sender: mpsc::Sender<Vec<u8>>,
+}
+
+// NAT traversal server - runs as a standalone server to facilitate connections
+#[derive(Clone)]
 pub struct RelayServer {
-    clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
-    public_ip: Option<String>,
-    auth_secret: Option<String>,
+    clients: Arc<TokioMutex<HashMap<String, ClientInfo>>>,
+    relay_sessions: Arc<TokioMutex<HashMap<String, RelaySession>>>,
+    public_ip: Option<String>, // Store the server's public IP address
+    auth_secret: String, // Authentication secret
+    unauthorized_attempts: Arc<AtomicUsize>, // Track unauthorized connection attempts
 }
 
 impl RelayServer {
-    /// Create a new relay server
     pub fn new(public_ip: Option<String>, auth_secret: Option<String>) -> Self {
         Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(TokioMutex::new(HashMap::new())),
+            relay_sessions: Arc::new(TokioMutex::new(HashMap::new())),
             public_ip,
-            auth_secret,
+            auth_secret: auth_secret.unwrap_or_else(|| DEFAULT_AUTH_SECRET.to_string()),
+            unauthorized_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
     
-    /// Start the relay server
+    // Run the server and start accepting connections
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
-        // Start the health check endpoint on port 8080
-        let health_check_addr = format!("0.0.0.0:{}", HEALTH_CHECK_PORT);
-        // Pass the health_check_addr as an owned String to avoid lifetime issues
-        let health_check_server = Self::run_health_check(health_check_addr);
+        info!("Starting NAT traversal relay server on {}", bind_addr);
         
-        // Bind to the specified address for the main server
+        // Bind the TCP listener to the specified address
         let listener = TcpListener::bind(bind_addr).await?;
-        info!("TagIO relay server listening on {}", bind_addr);
         
-        // Log the public IP if provided
-        if let Some(ip) = &self.public_ip {
-            info!("Server public IP configured as: {}", ip);
+        if let Some(public_ip) = &self.public_ip {
+            info!("Server configured with public IP: {}", public_ip);
         } else {
-            warn!("WARNING: No public IP configured. NAT traversal may not work correctly!");
-            warn!("You should specify a public IP in the configuration.");
+            warn!("No public IP configured. NAT traversal may be limited.");
+            warn!("Server will use client-reported public addresses for NAT traversal.");
         }
         
-        // Log authentication status
-        if self.auth_secret.is_some() {
-            info!("Authentication enabled for client connections");
-        } else {
-            info!("Authentication disabled - all connections will be accepted");
-        }
-        
-        // Spawn health check task
-        tokio::spawn(health_check_server);
-        
-        // Accept and handle connections
+        // Accept incoming connections
         loop {
-            let (socket, addr) = listener.accept().await?;
-            info!("New connection from {}", addr);
-            
-            // Use public IP if configured, otherwise use the detected address
-            let public_addr = if let Some(ip) = &self.public_ip {
-                let port = addr.port();
-                match IpAddr::from_str(ip) {
-                    Ok(ip_addr) => {
-                        info!("Using configured public IP: {}", ip_addr);
-                        SocketAddr::new(ip_addr, port)
-                    },
-                    Err(_) => {
-                        warn!("Failed to parse configured public IP: {}", ip);
-                        addr
-                    }
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    debug!("New connection from {}", addr);
+                    
+                    // Clone necessary state for the client handler
+                    let server = self.clone();
+                    
+                    // Handle each client in a separate task
+                    tokio::spawn(async move {
+                        if let Err(e) = server.handle_client(socket, addr).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
                 }
-            } else {
-                info!("Using detected IP: {}", addr);
-                addr
-            };
-            
-            // Handle the connection in a new task
-            let clients = self.clients.clone();
-            let auth_secret = self.auth_secret.clone();
-            
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(socket, addr, public_addr, clients, auth_secret).await {
-                    error!("Error handling client {}: {}", addr, e);
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
+                    // Small delay to prevent tight loop in case of persistent error
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            });
+            }
         }
     }
     
-    /// Handle a client connection
-    async fn handle_client(
-        socket: TcpStream, 
-        addr: SocketAddr,
-        public_addr: SocketAddr,
-        clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
-        auth_secret: Option<String>,
-    ) -> Result<()> {
-        // Create a channel for sending messages to this client
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+    // Handle a client connection
+    async fn handle_client(&self, socket: TcpStream, addr: SocketAddr) -> Result<()> {
+        trace!("Handling new client connection from {}", addr);
         
-        // Split the socket for concurrent reading and writing
-        let (mut reader, mut writer) = socket.into_split();
+        // Get socket info for later use
+        let peer_addr = socket.peer_addr()?;
         
-        info!("Client connection from {}, public address: {}", addr, public_addr);
-        
-        // Spawn a task for handling outgoing messages
-        let writer_handle = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Err(e) = writer.write_all(&msg).await {
-                    error!("Error writing to client: {}", e);
-                    break;
+        // Establish the public address to use for NAT traversal
+        let public_addr = if let Some(ip_str) = &self.public_ip {
+            match ip_str.parse() {
+                Ok(ip) => SocketAddr::new(ip, peer_addr.port()),
+                Err(_) => {
+                    warn!("Invalid configured public IP: {}. Using client reported address.", ip_str);
+                    peer_addr
                 }
             }
-        });
-        
-        // Read the client ID (first 4 bytes are the ID length, then the ID string)
-        let mut id_len_bytes = [0u8; 4];
-        
-        // Read with timeout, properly handling errors
-        match tokio::time::timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS), reader.read_exact(&mut id_len_bytes)).await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    error!("Error reading client ID length: {}", e);
-                    return Err(anyhow::Error::new(e));
-                }
-            },
-            Err(_) => {
-                error!("Timeout reading client ID length");
-                return Err(anyhow!("Timeout reading client ID"));
-            }
-        }
-        
-        let id_len = u32::from_be_bytes(id_len_bytes) as usize;
-        if id_len > MAX_ID_LENGTH {
-            // Prevent excessive memory allocation
-            error!("Client ID too long: {}", id_len);
-            return Err(anyhow!("Client ID too long"));
-        }
-        
-        let mut id_bytes = vec![0u8; id_len];
-        
-        // Read with timeout, properly handling errors
-        match tokio::time::timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS), reader.read_exact(&mut id_bytes)).await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    error!("Error reading client ID: {}", e);
-                    return Err(anyhow::Error::new(e));
-                }
-            },
-            Err(_) => {
-                error!("Timeout reading client ID");
-                return Err(anyhow!("Timeout reading client ID"));
-            }
-        }
-        
-        let client_id = match String::from_utf8(id_bytes) {
-            Ok(id) => id,
-            Err(e) => {
-                error!("Invalid client ID encoding: {}", e);
-                return Err(anyhow!("Invalid client ID encoding"));
-            }
+        } else {
+            peer_addr
         };
         
-        // Verify authentication if enabled
-        if let Some(secret) = auth_secret {
-            // Read authentication data
-            let mut auth_len_bytes = [0u8; 4];
-            match tokio::time::timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS), reader.read_exact(&mut auth_len_bytes)).await {
-                Ok(result) => {
-                    if let Err(e) = result {
-                        error!("Error reading auth data length: {}", e);
-                        return Err(anyhow::Error::new(e));
-                    }
-                },
-                Err(_) => {
-                    error!("Timeout reading auth data length");
-                    return Err(anyhow!("Timeout reading auth data"));
-                }
-            }
-            
-            let auth_len = u32::from_be_bytes(auth_len_bytes) as usize;
-            if auth_len > MAX_AUTH_LENGTH {
-                // Prevent excessive memory allocation
-                error!("Auth data too long: {}", auth_len);
-                return Err(anyhow!("Auth data too long"));
-            }
-            
-            let mut auth_bytes = vec![0u8; auth_len];
-            match tokio::time::timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS), reader.read_exact(&mut auth_bytes)).await {
-                Ok(result) => {
-                    if let Err(e) = result {
-                        error!("Error reading auth data: {}", e);
-                        return Err(anyhow::Error::new(e));
-                    }
-                },
-                Err(_) => {
-                    error!("Timeout reading auth data");
-                    return Err(anyhow!("Timeout reading auth data"));
-                }
-            }
-            
-            let auth_str = match String::from_utf8(auth_bytes) {
-                Ok(auth) => auth,
-                Err(e) => {
-                    error!("Invalid auth data encoding: {}", e);
-                    return Err(anyhow!("Invalid auth data encoding"));
-                }
-            };
-            
-            // Verify the authentication secret
-            if auth_str != secret {
-                error!("Authentication failed for client {}", client_id);
-                
-                // Send auth failure message
-                let mut msg = Vec::new();
-                msg.extend_from_slice(&(MessageType::AuthFailure as u32).to_be_bytes());
-                if let Err(e) = tx.send(msg).await {
-                    error!("Error sending auth failure: {}", e);
-                }
-                
-                return Err(anyhow!("Authentication failed"));
-            }
-            
-            info!("Client {} authenticated successfully", client_id);
-        }
+        // Set up communication channels for this client
+        let (control_tx, mut control_rx) = mpsc::channel::<NatMessage>(100);
         
-        info!("Client {} registered as '{}'", addr, client_id);
+        // Split the socket for concurrent reading and writing
+        let (mut read, mut write) = tokio::io::split(socket);
         
-        // Register the client
-        {
-            let mut clients_map = clients.lock().await;
-            clients_map.insert(client_id.clone(), ClientInfo {
-                public_addr,
-                sender: tx.clone(),
-            });
-            
-            // Send registration acknowledgment to the client
-            let mut msg = Vec::new();
-            msg.extend_from_slice(&(MessageType::ClientRegistered as u32).to_be_bytes());
-            // Send the public IP and port as seen by the server
-            msg.extend_from_slice(&public_addr.ip().to_string().len().to_be_bytes());
-            msg.extend_from_slice(public_addr.ip().to_string().as_bytes());
-            msg.extend_from_slice(&public_addr.port().to_be_bytes());
-            
-            if let Err(e) = tx.send(msg).await {
-                error!("Error sending registration ack: {}", e);
-            }
-        }
-        
-        // Process connection requests
-        loop {
-            // Read message type
-            let mut msg_type_bytes = [0u8; 4];
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS * 6), // Use longer timeout for regular operation
-                reader.read_exact(&mut msg_type_bytes)
-            ).await;
-            
-            let msg_type = match read_result {
-                Ok(Ok(_)) => u32::from_be_bytes(msg_type_bytes),
-                Ok(Err(e)) => {
-                    error!("Error reading message type: {}", e);
-                    break;
-                },
-                Err(_) => {
-                    // Timeout, client might be disconnected
-                    error!("Timeout reading message type, client disconnected");
-                    break;
-                }
-            };
-            
-            match msg_type {
-                // Connection request (type 1)
-                1 => {
-                    // Read target ID length
-                    let mut target_id_len_bytes = [0u8; 4];
-                    if let Err(e) = reader.read_exact(&mut target_id_len_bytes).await {
-                        error!("Error reading target ID length: {}", e);
-                        break;
-                    }
-                    
-                    let target_id_len = u32::from_be_bytes(target_id_len_bytes) as usize;
-                    if target_id_len > MAX_ID_LENGTH {
-                        error!("Target ID too long: {}", target_id_len);
-                        break;
-                    }
-                    
-                    let mut target_id_bytes = vec![0u8; target_id_len];
-                    if let Err(e) = reader.read_exact(&mut target_id_bytes).await {
-                        error!("Error reading target ID: {}", e);
-                        break;
-                    }
-                    
-                    let target_id = match String::from_utf8(target_id_bytes) {
-                        Ok(id) => id,
+        // Spawn a task for sending messages to the client
+        let write_task = {
+            tokio::spawn(async move {
+                while let Some(message) = control_rx.recv().await {
+                    trace!("Sending message to {}: {:?}", addr, message);
+                    match bincode::serialize(&message) {
+                        Ok(data) => {
+                            if let Err(e) = write.write_all(&data).await {
+                                error!("Error writing to client {}: {}", addr, e);
+                                break;
+                            }
+                        }
                         Err(e) => {
-                            error!("Invalid target ID encoding: {}", e);
+                            error!("Error serializing message for {}: {}", addr, e);
                             break;
                         }
-                    };
-                    
-                    info!("Client {} requested connection to {}", client_id, target_id);
-                    
-                    // Find the target client
-                    let clients_map = clients.lock().await;
-                    if let Some(target_info) = clients_map.get(&target_id) {
-                        // Send connection request to target
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(&(MessageType::ConnectionRequest as u32).to_be_bytes());
-                        
-                        // Add source client ID length and bytes
-                        msg.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
-                        msg.extend_from_slice(client_id.as_bytes());
-                        
-                        // Add source client public address
-                        msg.extend_from_slice(&public_addr.ip().to_string().len().to_be_bytes());
-                        msg.extend_from_slice(public_addr.ip().to_string().as_bytes());
-                        msg.extend_from_slice(&public_addr.port().to_be_bytes());
-                        
-                        if let Err(e) = target_info.sender.send(msg).await {
-                            error!("Error sending connection request to target: {}", e);
+                    }
+                }
+                debug!("Client sender task for {} terminated", addr);
+            })
+        };
+        
+        // Buffer for incoming data
+        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+        let mut client_id = String::new();
+        let mut authenticated = false;
+        
+        // Process messages from the client
+        loop {
+            // Read with timeout to detect dead connections
+            match timeout(KEEP_ALIVE_TIMEOUT, read.read(&mut buffer)).await {
+                Ok(Ok(0)) => {
+                    // Connection closed by client
+                    debug!("Client {} disconnected", addr);
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    // Deserialize the message
+                    match bincode::deserialize::<NatMessage>(&buffer[..n]) {
+                        Ok(message) => {
+                            trace!("Received message from {}: {:?}", addr, message);
+                            
+                            // Handle client authentication first
+                            if !authenticated {
+                                match &message {
+                                    NatMessage::Authenticate { secret, client_id: id } => {
+                                        if secret == &self.auth_secret {
+                                            authenticated = true;
+                                            client_id = id.clone();
+                                            
+                                            // Register the client
+                                            self.register_client(id.clone(), public_addr, control_tx.clone()).await?;
+                                            
+                                            // Send acknowledgment with public address
+                                            control_tx.send(NatMessage::AuthAck { 
+                                                public_addr, 
+                                                message: format!("Authenticated as {}", id) 
+                                            }).await?;
+                                            
+                                            info!("Client {} registered with ID {}", addr, id);
+                                        } else {
+                                            // Invalid authentication
+                                            let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                                            if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
+                                                warn!("Multiple unauthorized connection attempts detected ({})", attempts);
+                                            }
+                                            
+                                            // Send auth failure and close connection
+                                            let _ = control_tx.send(NatMessage::AuthError { 
+                                                message: "Invalid authentication secret".to_string() 
+                                            }).await;
+                                            
+                                            // Wait a bit before closing to allow the error to be sent
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        // Client must authenticate first
+                                        let _ = control_tx.send(NatMessage::AuthError { 
+                                            message: "Authentication required".to_string() 
+                                        }).await;
+                                        
+                                        // Wait a bit before closing to allow the error to be sent
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Process authenticated client messages
+                                match message {
+                                    NatMessage::Ping => {
+                                        // Respond to ping with pong
+                                        if let Err(e) = control_tx.send(NatMessage::Pong).await {
+                                            error!("Failed to send pong to {}: {}", addr, e);
+                                        }
+                                    }
+                                    NatMessage::ConnectRequest { target_id } => {
+                                        // Handle connection request
+                                        self.handle_connect_request(&client_id, &target_id, control_tx.clone()).await?;
+                                    }
+                                    NatMessage::RelayRequest { target_id, session_id } => {
+                                        // Handle relay request
+                                        self.handle_relay_request(&client_id, &target_id, &session_id, control_tx.clone()).await?;
+                                    }
+                                    NatMessage::RelayData { session_id, data } => {
+                                        // Forward relay data
+                                        self.handle_relay_data(&session_id, data).await?;
+                                    }
+                                    _ => {
+                                        // Other message types can be handled as needed
+                                        trace!("Unhandled message type from {}: {:?}", addr, message);
+                                    }
+                                }
+                            }
                         }
-                        
-                        // Send the target's connection info back to the requester
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(&(MessageType::ConnectionInfo as u32).to_be_bytes());
-                        
-                        // Add target client ID length and bytes
-                        msg.extend_from_slice(&(target_id.len() as u32).to_be_bytes());
-                        msg.extend_from_slice(target_id.as_bytes());
-                        
-                        // Add target public address
-                        msg.extend_from_slice(&target_info.public_addr.ip().to_string().len().to_be_bytes());
-                        msg.extend_from_slice(target_info.public_addr.ip().to_string().as_bytes());
-                        msg.extend_from_slice(&target_info.public_addr.port().to_be_bytes());
-                        
-                        if let Err(e) = tx.send(msg).await {
-                            error!("Error sending target info to requester: {}", e);
-                        }
-                    } else {
-                        info!("Target client {} not found", target_id);
-                        
-                        // Send error response
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(&6u32.to_be_bytes()); // Type 6 = client not found
-                        msg.extend_from_slice(&(target_id.len() as u32).to_be_bytes());
-                        msg.extend_from_slice(target_id.as_bytes());
-                        
-                        if let Err(e) = tx.send(msg).await {
-                            error!("Error sending client not found message: {}", e);
+                        Err(e) => {
+                            warn!("Failed to deserialize message from {}: {}", addr, e);
+                            // Continue - the next message might be valid
                         }
                     }
-                },
-                
-                // Ping message (type 7)
-                7 => {
-                    // Respond with pong (type 8)
-                    let msg = Vec::from(&8u32.to_be_bytes()[..]);
-                    if let Err(e) = tx.send(msg).await {
-                        error!("Error sending pong response: {}", e);
+                }
+                Ok(Err(e)) => {
+                    error!("Error reading from client {}: {}", addr, e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout occurred
+                    debug!("Read timeout for client {}, sending ping", addr);
+                    
+                    // Send ping to check if client is still alive
+                    if let Err(e) = control_tx.send(NatMessage::Ping).await {
+                        error!("Failed to send ping to {}: {}", addr, e);
                         break;
                     }
-                },
-                
-                // Unknown message type
-                _ => {
-                    error!("Unknown message type: {}", msg_type);
-                    break;
                 }
             }
         }
         
-        // Client disconnected or error occurred
-        info!("Client {} disconnected", client_id);
-        
-        // Remove client from registry
-        {
-            let mut clients_map = clients.lock().await;
-            clients_map.remove(&client_id);
-            info!("Removed client {} from registry", client_id);
+        // Clean up client resources
+        if !client_id.is_empty() {
+            debug!("Removing client {} ({})", client_id, addr);
+            let mut clients = self.clients.lock().await;
+            clients.remove(&client_id);
         }
         
-        // Cancel the writer task
-        writer_handle.abort();
+        // Abort write task
+        write_task.abort();
         
         Ok(())
     }
     
-    /// Run a simple health check HTTP server
-    async fn run_health_check(addr: String) -> Result<()> {
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind health check server: {}", e);
-                return Err(anyhow!("Failed to bind health check server: {}", e));
-            }
-        };
+    // Register a client with the server
+    async fn register_client(&self, client_id: String, public_addr: SocketAddr, control_sender: mpsc::Sender<NatMessage>) -> Result<()> {
+        let mut clients = self.clients.lock().await;
         
-        info!("Health check server listening on {}", addr);
+        // Check if client ID already exists
+        if clients.contains_key(&client_id) {
+            warn!("Client ID {} already registered, overwriting", client_id);
+        }
         
-        loop {
-            let (mut socket, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Error accepting health check connection: {}", e);
-                    continue;
-                }
-            };
+        // Store client information
+        clients.insert(client_id.clone(), ClientInfo {
+            public_addr,
+            control_sender,
+        });
+        
+        Ok(())
+    }
+    
+    // Handle a connect request from one client to another
+    async fn handle_connect_request(&self, client_id: &str, target_id: &str, control_sender: mpsc::Sender<NatMessage>) -> Result<()> {
+        debug!("Connect request from {} to {}", client_id, target_id);
+        
+        // Get client info
+        let clients = self.clients.lock().await;
+        
+        // Get target client info
+        if let Some(target_client) = clients.get(target_id) {
+            // Send connection info to the requestor
+            control_sender.send(NatMessage::ConnectionInfo {
+                client_id: target_id.to_string(),
+                public_addr: target_client.public_addr,
+                private_addrs: Vec::new(), // No private addresses in this implementation
+            }).await?;
             
+            // Send connect notification to the target
+            if let Err(e) = target_client.control_sender.send(NatMessage::ConnectNotification {
+                client_id: client_id.to_string(),
+                public_addr: clients.get(client_id)
+                    .map(|info| info.public_addr)
+                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+            }).await {
+                error!("Failed to send connect notification to {}: {}", target_id, e);
+                return Err(anyhow!("Failed to notify target client"));
+            }
+            
+            info!("Connection facilitated between {} and {}", client_id, target_id);
+        } else {
+            // Target client not found
+            warn!("Connect request for unknown client: {}", target_id);
+            control_sender.send(NatMessage::Error {
+                message: format!("Target client {} not found", target_id),
+            }).await?;
+        }
+        
+        Ok(())
+    }
+    
+    // Handle a relay request for direct data forwarding
+    async fn handle_relay_request(&self, client_id: &str, target_id: &str, session_id: &str, control_sender: mpsc::Sender<NatMessage>) -> Result<()> {
+        debug!("Relay request from {} to {} with session {}", client_id, target_id, session_id);
+        
+        // Get client info
+        let clients = self.clients.lock().await;
+        
+        // Get target client info
+        if let Some(target_client) = clients.get(target_id) {
+            // Create data channels for the relay
+            let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(100);
+            
+            // Store the relay session
+            {
+                let mut sessions = self.relay_sessions.lock().await;
+                sessions.insert(session_id.to_string(), RelaySession {
+                    data_sender: data_tx.clone(),
+                });
+            }
+            
+            // Clone target sender for the relay task
+            let target_sender = target_client.control_sender.clone();
+            // Clone the session_id for the spawned task
+            let session_id_for_task = session_id.to_string();
+            
+            // Create task for relay forwarding
             tokio::spawn(async move {
-                let mut buf = [0; 1024];
-                match socket.read(&mut buf).await {
-                    Ok(_) => {
-                        // Simple HTTP response
-                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                        if let Err(e) = socket.write_all(response.as_bytes()).await {
-                            error!("Error writing health check response: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        error!("Error reading from health check connection: {}", e);
+                while let Some(data) = data_rx.recv().await {
+                    if let Err(e) = target_sender.send(NatMessage::RelayData {
+                        session_id: session_id_for_task.clone(),
+                        data,
+                    }).await {
+                        error!("Failed to relay data: {}", e);
+                        break;
                     }
                 }
+                debug!("Relay forwarding task for session {} terminated", session_id_for_task);
             });
+            
+            // Notify both clients about the relay
+            control_sender.send(NatMessage::RelayEstablished {
+                session_id: session_id.to_string(),
+                target_id: target_id.to_string(),
+            }).await?;
+            
+            target_client.control_sender.send(NatMessage::RelayRequested {
+                session_id: session_id.to_string(),
+                client_id: client_id.to_string(),
+            }).await?;
+            
+            info!("Relay established between {} and {} with session {}", client_id, target_id, session_id);
+        } else {
+            // Target client not found
+            warn!("Relay request for unknown client: {}", target_id);
+            control_sender.send(NatMessage::Error {
+                message: format!("Target client {} not found", target_id),
+            }).await?;
         }
+        
+        Ok(())
+    }
+    
+    // Handle relay data forwarding
+    async fn handle_relay_data(&self, session_id: &str, data: Vec<u8>) -> Result<()> {
+        trace!("Relay data for session {} ({} bytes)", session_id, data.len());
+        
+        // Get relay session
+        let sessions = self.relay_sessions.lock().await;
+        
+        // Forward data if session exists
+        if let Some(session) = sessions.get(session_id) {
+            if let Err(e) = session.data_sender.send(data).await {
+                error!("Failed to forward relay data for session {}: {}", session_id, e);
+                return Err(anyhow!("Failed to forward relay data"));
+            }
+        } else {
+            // Session not found
+            warn!("Relay data for unknown session: {}", session_id);
+            return Err(anyhow!("Unknown relay session"));
+        }
+        
+        Ok(())
     }
 } 

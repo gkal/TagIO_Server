@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize};
 use std::net::SocketAddr;
 
-/// Messages used for NAT traversal
+/// Messages used for NAT traversal and relay functionality
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum NatMessage {
+pub enum RelayMessage {
     // Authentication messages
-    Authenticate { secret: String, client_id: String },
-    AuthAck { public_addr: SocketAddr, message: String },
-    AuthError { message: String },
+    AuthRequest { client_id: String, auth_token: String },
+    AuthSuccess { client_id: String },
+    AuthFailure { reason: String },
     
     // Registration messages
     Register { client_id: String },
@@ -16,18 +16,23 @@ pub enum NatMessage {
     // Connection establishment
     ConnectRequest { target_id: String },
     ConnectionInfo { client_id: String, public_addr: SocketAddr, private_addrs: Vec<SocketAddr> },
-    ConnectNotification { client_id: String, public_addr: SocketAddr },
     
     // Relay functionality
-    RelayRequest { target_id: String, session_id: String },
-    RelayEstablished { session_id: String, target_id: String },
-    RelayRequested { session_id: String, client_id: String },
+    RelayRequest { session_id: String },
+    RelayAccept { session_id: String },
     RelayData { session_id: String, data: Vec<u8> },
-    
-    // Error
-    Error { message: String },
     
     // Keep-alive
     Ping,
     Pong,
+}
+
+/// Simple message types for direct TCP communication
+#[derive(Debug)]
+pub enum MessageType {
+    // Message types as used in tagio_relay_server.rs
+    AuthFailure = 2,
+    ClientRegistered = 3,
+    ConnectionRequest = 4,
+    ConnectionInfo = 5,
 } 
