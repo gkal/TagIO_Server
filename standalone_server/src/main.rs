@@ -16,7 +16,7 @@ mod server;
 
 // Custom logging filter module
 mod log_filter {
-    use log::{Record, Metadata, Level, LevelFilter};
+    use log::{Record, Metadata, LevelFilter};
     use std::net::IpAddr;
     use std::str::FromStr;
     
@@ -374,11 +374,18 @@ async fn main() -> Result<()> {
     println!("Protocol Version: {}", PROTOCOL_VERSION);
     info!("Bind Address: {}", bind_addr);
     println!("Bind Address: {}", bind_addr);
-    println!("IMPORTANT: Port 10000 must be accessible for TagIO clients to connect");
-    println!("IMPORTANT: Make sure your firewall allows TCP traffic on port 10000");
-    if let Some(ip) = &public_ip {
-        info!("Public IP: {} (explicitly configured)", ip);
-        println!("Public IP: {} (explicitly configured)", ip);
+    if is_render || is_cloud {
+        // Cloud deployment - clients need to use port 443
+        println!("IMPORTANT: In cloud deployment, clients should connect to port 443");
+        println!("IMPORTANT: Internal binding is port 10000, but external access is via port 443");
+    } else {
+        // Local deployment - clients connect directly to the bound port
+        println!("IMPORTANT: Port 10000 must be accessible for TagIO clients to connect");
+        println!("IMPORTANT: Make sure your firewall allows TCP traffic on port 10000");
+    }
+    if public_ip.is_some() {
+        info!("Public IP: {} (explicitly configured)", public_ip.as_ref().unwrap());
+        println!("Public IP: {} (explicitly configured)", public_ip.as_ref().unwrap());
     } else {
         info!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
         println!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
@@ -403,10 +410,15 @@ async fn main() -> Result<()> {
     info!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
     println!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
     info!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
-    println!("PORT NOTE: Clients should connect to port 10000 for TagIO protocol");
-    info!("PORT NOTE: Clients should connect to port 10000 for TagIO protocol");
-    println!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
-    info!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
+    println!("PORT NOTE: Clients should connect to port 443 for TagIO protocol");
+    info!("PORT NOTE: Clients should connect to port 443 for TagIO protocol");
+    if is_render || is_cloud {
+        println!("PORT NOTE: Port 443 handles both TagIO protocol and HTTP health checks");
+        info!("PORT NOTE: Port 443 handles both TagIO protocol and HTTP health checks");
+    } else {
+        println!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
+        info!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
+    }
     println!("==========================================");
     info!("==========================================");
     

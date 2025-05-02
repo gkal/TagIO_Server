@@ -147,7 +147,62 @@ Inspired by projects like:
 
 # TagIO Relay Server
 
-A NAT traversal relay server to facilitate peer-to-peer connections between clients behind NAT.
+A NAT traversal and relay server for TagIO remote desktop connections.
+
+## Server Configuration
+
+The TagIO Relay Server is designed to run on [Render](https://render.com) and facilitate connections between TagIO clients.
+
+### Server Features
+
+- NAT traversal to establish direct peer-to-peer connections
+- Fallback relay functionality when direct connections aren't possible
+- Health check endpoints for cloud provider verification
+- Authentication to secure connections
+- Support for automatic port binding in cloud environments
+
+## Client Configuration
+
+When connecting to the TagIO Relay Server on Render, use the following settings:
+
+### Server Connection Settings
+
+- **Server address:** `tagio.onrender.com`
+- **Port:** `443` (NOT port 10000)
+- **Protocol:** TagIO NAT Traversal Protocol v1
+- **Fallback ports:** `80` (if 443 is blocked)
+
+### Connection Troubleshooting
+
+1. **Cannot connect to server:**
+   - Verify you're using port 443, not port 10000
+   - Check your network firewall isn't blocking outbound HTTPS traffic
+   - Try the fallback port 80 if port 443 is blocked
+
+2. **Authentication errors:**
+   - Ensure you're using the correct authentication token
+   - Default token is "tagio_default_secret" unless customized
+
+3. **Protocol errors:**
+   - Ensure you're using the TagIO protocol, not attempting an HTTP connection
+   - Make sure your client software is updated to the latest version
+
+## Running the Server Locally
+
+To run the server locally for development:
+
+```bash
+cargo run --bin tagio_relay_server -- --bind 0.0.0.0:10000 --verbose
+```
+
+## Production Deployment
+
+The server is designed to be deployed to Render.com with the following environment:
+
+- **PORT:** Set to `10000` (for internal binding)
+- **Public URL:** Will be available at `tagio.onrender.com:443`
+
+Important: Clients should always connect to the public URL on port 443, not the internal port.
 
 ## 🔧 Tech Stack
 

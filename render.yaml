@@ -2,18 +2,20 @@ services:
   - type: web
     name: tagio-relay-server
     env: rust
-    plan: free # Change to starter/standard for production
-    buildCommand: cargo build --release
-    startCommand: ./target/release/tagio_relay_server
+    buildCommand: cargo build --release --bin tagio_relay_server
+    startCommand: PORT=10000 ./target/release/tagio_relay_server --force_cloud_ip
+    region: frankfurt
+    plan: starter
+    healthCheckPath: /
+    # The following envVars are used for configuration
     envVars:
-      - key: PORT
-        value: 10000
-      - key: PUBLIC_IP
-        sync: false # Will be auto-detected, but can be manually set in dashboard
-      - key: AUTH_SECRET
-        sync: false # Add in dashboard for security
-    healthCheckPath: / # Health check endpoint
-    # Deployment settings
+      - key: AUTH_TOKEN
+        sync: false # Set to false to allow custom values per environment
+      - key: RUST_LOG
+        value: info
+    
+    # Render automatically sets PORT=10000 for web services
+    # The server is internally bound to port 10000, but clients should connect on 443
     autoDeploy: true
     # Scaling settings (Pro+ plans only)
     scaling:

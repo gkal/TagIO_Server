@@ -22,8 +22,6 @@ use crate::constants::{
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 // Buffer size for reading from clients
 const READ_BUFFER_SIZE: usize = 8192;
-// Maximum number of unauthorized attempts before logging a warning
-const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
 // Health check server ports
 const HEALTH_CHECK_PORTS: [u16; 3] = [8888, 8080, 3000];
 
