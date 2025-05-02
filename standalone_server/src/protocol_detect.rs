@@ -21,6 +21,28 @@ pub fn is_http_request(data: &[u8]) -> bool {
     data.starts_with(b"HTTP/")
 }
 
+/// Check if this is a special TagIO protocol over HTTP header
+pub fn is_tagio_protocol_http(data: &[u8]) -> bool {
+    if data.len() < 30 {
+        return false;
+    }
+    
+    // Quick check if this looks like a POST request to /tagio
+    if !data.starts_with(b"POST /tagio HTTP/1.1") {
+        return false;
+    }
+    
+    // Convert to string to look for TagIO headers
+    if let Ok(header_str) = std::str::from_utf8(data) {
+        // Check for TagIO protocol headers
+        header_str.contains("X-TagIO-Protocol:") &&
+        header_str.contains("Content-Type: application/tagio") &&
+        (header_str.contains("Upgrade: TagIO") || header_str.contains("Connection: Upgrade"))
+    } else {
+        false
+    }
+}
+
 /// Handles an incoming connection with protocol detection
 pub async fn handle_connection_with_protocol_detection<R, W>(
     mut reader: R, 
@@ -32,8 +54,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Create a buffer for reading initial bytes
-    let mut initial_buffer = [0u8; 16]; // 16 bytes should be enough for protocol detection
+    // Create a buffer for reading initial bytes - make it larger to handle HTTP headers
+    let mut initial_buffer = [0u8; 512]; // Increased from 16 to 512 bytes to handle HTTP headers
     
     // Read the initial bytes from the connection
     let bytes_read = match reader.read(&mut initial_buffer).await {
@@ -44,7 +66,19 @@ where
     
     let initial_data = &initial_buffer[..bytes_read];
     
-    // Check if it's an HTTP request
+    // Check if it's a TagIO protocol message using our special HTTP header
+    if is_tagio_protocol_http(initial_data) {
+        info!("Detected TagIO protocol over HTTP from {}", client_addr);
+        
+        // At this point, we've detected a TagIO client using our HTTP workaround
+        // The client will now send normal TagIO protocol messages
+        
+        // Return true indicating this is a TagIO protocol connection
+        // We don't return any initial data because the HTTP header was just for protocol detection
+        return Ok((true, Vec::new()));
+    }
+    
+    // Check if it's a regular HTTP request
     if is_http_request(initial_data) {
         info!("Detected HTTP request from {}", client_addr);
         

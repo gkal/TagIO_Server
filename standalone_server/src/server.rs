@@ -424,10 +424,32 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
                     break;
                 },
                 Ok(Ok(n)) => {
-                    // Check for HTTP request immediately (clients sometimes try HTTP first)
+                    // After the client connection, look for the HTTP-like header from the TagIO client
+                    if !authenticated && n >= 20 && buffer.starts_with(b"POST /tagio HTTP/1.1") {
+                        // This might be a TagIO client using HTTP headers to bypass proxies
+                        
+                        // Convert to string to check for TagIO protocol headers
+                        if let Ok(header_str) = std::str::from_utf8(&buffer[..std::cmp::min(512, n)]) {
+                            if header_str.contains("X-TagIO-Protocol:") && 
+                               header_str.contains("Content-Type: application/tagio") {
+                                // This is our TagIO client using HTTP headers
+                                if !is_local {
+                                    info!("Detected TagIO client using HTTP headers from {}", addr);
+                                }
+                                
+                                // Don't treat this as HTTP, allow authentication to proceed
+                                protocol_verified = true;
+                                
+                                // No need to send HTTP response, wait for authentication
+                                continue;
+                            }
+                        }
+                    }
+
+                    // If we didn't detect TagIO protocol, check if this is standard HTTP
                     if !authenticated && (
                         buffer.starts_with(b"GET ") || 
-                        buffer.starts_with(b"POST ") || 
+                        buffer.starts_with(b"POST ") && !buffer.starts_with(b"POST /tagio") || 
                         buffer.starts_with(b"HTTP") ||
                         buffer.starts_with(b"HEAD ") ||
                         buffer.starts_with(b"PUT ") ||
