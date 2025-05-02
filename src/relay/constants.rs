@@ -1,14 +1,14 @@
 //! Constants for the relay module
 
-// Default relay server address - prefer connecting via HTTP port for better firewall traversal
-// Changed from port 443 to 80 to avoid HTTP protocol handling by Render's load balancer
-pub const DEFAULT_RELAY_SERVER: &str = "tagio-server.onrender.com:80";
+// Default relay server address - prefer connecting via non-standard port to avoid HTTP protocol handling
+// Changed from port 80 to 7568 to avoid Render's HTTP protocol handling on standard ports
+pub const DEFAULT_RELAY_SERVER: &str = "tagio-server.onrender.com:7568";
 
 // Alternative port to try if main port is blocked
 pub const RELAY_SERVICE_ALT_PORT: u16 = 443;
 
-// Fallback port if both HTTP and HTTPS are blocked
-pub const RELAY_SERVICE_FALLBACK_PORT: u16 = 7568;
+// Fallback port if both main and alternative ports are blocked
+pub const RELAY_SERVICE_FALLBACK_PORT: u16 = 80;
 
 // UPnP lease duration in seconds (1 hour)
 pub const UPNP_LEASE_DURATION: u32 = 3600;

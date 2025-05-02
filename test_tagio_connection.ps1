@@ -32,17 +32,17 @@ try {
 Write-Host ""
 Write-Host "2. Testing TCP connectivity..."
 
-# Test port 80 (Primary TCP port)
-Write-Host "   Testing connection to $serverName:80 (Primary TCP port)..."
+# Test port 7568 (Primary TCP port)
+Write-Host "   Testing connection to $serverName:7568 (Primary TCP port)..."
 try {
-    $tcp80Result = Test-NetConnection -ComputerName $serverName -Port 80 -ErrorAction Stop -WarningAction SilentlyContinue
-    if ($tcp80Result.TcpTestSucceeded) {
-        Write-Host "   ✅ Successfully connected to $serverName:80" -ForegroundColor Green
+    $tcp7568Result = Test-NetConnection -ComputerName $serverName -Port 7568 -ErrorAction Stop -WarningAction SilentlyContinue
+    if ($tcp7568Result.TcpTestSucceeded) {
+        Write-Host "   ✅ Successfully connected to $serverName:7568" -ForegroundColor Green
     } else {
-        Write-Host "   ❌ Failed to connect to $serverName:80" -ForegroundColor Red
+        Write-Host "   ❌ Failed to connect to $serverName:7568" -ForegroundColor Red
     }
 } catch {
-    Write-Host "   ❌ Error testing connection to $serverName:80" -ForegroundColor Red
+    Write-Host "   ❌ Error testing connection to $serverName:7568" -ForegroundColor Red
     Write-Host "      Error: $_"
 }
 
@@ -60,17 +60,17 @@ try {
     Write-Host "      Error: $_"
 }
 
-# Test port 7568 (Fallback port)
-Write-Host "   Testing connection to $serverName:7568 (Fallback port)..."
+# Test port 80 (Fallback port)
+Write-Host "   Testing connection to $serverName:80 (Fallback port)..."
 try {
-    $tcp7568Result = Test-NetConnection -ComputerName $serverName -Port 7568 -ErrorAction Stop -WarningAction SilentlyContinue
-    if ($tcp7568Result.TcpTestSucceeded) {
-        Write-Host "   ✅ Successfully connected to $serverName:7568" -ForegroundColor Green
+    $tcp80Result = Test-NetConnection -ComputerName $serverName -Port 80 -ErrorAction Stop -WarningAction SilentlyContinue
+    if ($tcp80Result.TcpTestSucceeded) {
+        Write-Host "   ✅ Successfully connected to $serverName:80" -ForegroundColor Green
     } else {
-        Write-Host "   ❌ Failed to connect to $serverName:7568" -ForegroundColor Red
+        Write-Host "   ❌ Failed to connect to $serverName:80" -ForegroundColor Red
     }
 } catch {
-    Write-Host "   ❌ Error testing connection to $serverName:7568" -ForegroundColor Red
+    Write-Host "   ❌ Error testing connection to $serverName:80" -ForegroundColor Red
     Write-Host "      Error: $_"
 }
 
@@ -78,22 +78,22 @@ Write-Host ""
 Write-Host "3. Summary:"
 Write-Host "--------------------------------------------------------"
 $dnsStatus = if ($null -ne $dnsResult) { "✅ Success" } else { "❌ Failed" }
-$port80Status = if ($tcp80Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
-$port443Status = if ($tcp443Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
 $port7568Status = if ($tcp7568Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
+$port443Status = if ($tcp443Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
+$port80Status = if ($tcp80Result.TcpTestSucceeded) { "✅ Success" } else { "❌ Failed" }
 
 Write-Host "DNS Resolution:         $dnsStatus"
-Write-Host "Port 80 (Primary):      $port80Status"
+Write-Host "Port 7568 (Primary):    $port7568Status"
 Write-Host "Port 443 (Alternative): $port443Status"
-Write-Host "Port 7568 (Fallback):   $port7568Status"
+Write-Host "Port 80 (Fallback):     $port80Status"
 Write-Host "--------------------------------------------------------"
 Write-Host ""
 
-if ($tcp80Result.TcpTestSucceeded) {
+if ($tcp7568Result.TcpTestSucceeded) {
     Write-Host "✅ Primary connection test successful!" -ForegroundColor Green
     Write-Host "   Your client should be able to connect to the TagIO relay server."
 } else {
-    if ($tcp443Result.TcpTestSucceeded -or $tcp7568Result.TcpTestSucceeded) {
+    if ($tcp443Result.TcpTestSucceeded -or $tcp80Result.TcpTestSucceeded) {
         Write-Host "⚠️ Primary connection failed, but alternative ports are available." -ForegroundColor Yellow
         Write-Host "   You may need to configure your client to use a different port."
     } else {
