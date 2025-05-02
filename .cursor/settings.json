@@ -1,0 +1,31 @@
+{
+  "projectType": "rust",
+  "defaultBranch": "main",
+  "knowledgeFiles": [
+    ".cursor/rules/deploy_emergency.md",
+    ".cursor/rules/error_handling.md",
+    "CONTRIBUTING.md",
+    "EMERGENCY.md"
+  ],
+  "ignoredFiles": [
+    "target/",
+    "dist/",
+    "*.exe",
+    "*.dll",
+    "*.log"
+  ],
+  "projectName": "TagIO Relay Server",
+  "priorities": {
+    "codeCompletion": true,
+    "errorSuggestions": true
+  },
+  "customPreferences": {
+    "emergencyActionPath": ".cursor/rules/deploy_emergency.md",
+    "errorHandlingConventions": ".cursor/rules/error_handling.md",
+    "renderDeployment": {
+      "suspendLink": "https://dashboard.render.com/",
+      "serviceType": "web",
+      "emergencyAction": "suspend"
+    }
+  }
+} 

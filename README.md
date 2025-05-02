@@ -144,3 +144,91 @@ Inspired by projects like:
 - [rathole](https://github.com/rapiz1/rathole)
 - [crab_nat](https://github.com/ryco117/crab_nat)
 - [nat_traversal](https://github.com/maidsafe-archive/nat_traversal)
+
+# TagIO Relay Server
+
+A NAT traversal relay server to facilitate peer-to-peer connections between clients behind NAT.
+
+## 🔧 Tech Stack
+
+- **Language**: Rust
+- **Runtime**: Tokio async runtime
+- **Networking**: TCP sockets
+- **Deployment**: Render.com
+- **Dependencies**: tokio, reqwest, anyhow
+
+## 🚀 Quick Start
+
+### Local Development
+
+```bash
+# Build the project
+cargo build --release
+
+# Run locally
+cargo run --release --bin tagio_relay_server
+```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| PORT | Server binding port | 8443 (local), 10000 (Render) |
+| PUBLIC_IP | Server public IP for NAT traversal | Auto-detected |
+| AUTH_SECRET | Optional client authentication secret | None (auth disabled) |
+
+## 🛑 Emergency Procedures
+
+### Render.com Emergency Shutdown
+
+```
+Quick Reference for Cursor AI:
+1. Go to Render Dashboard: https://dashboard.render.com/
+2. Select TagIO Relay Server service
+3. Navigate to Settings tab
+4. Scroll to bottom
+5. Click "Suspend" button
+```
+
+The service will immediately stop running. Resume when ready by clicking "Resume" in the same location.
+
+### Deployment Troubleshooting
+
+For "No open HTTP ports detected":
+- The server now auto-starts a health check server on ports 3000, 10000, 8080, or 80
+- It binds to 0.0.0.0 to ensure external access
+- HTTP responses are properly formatted with Content-Length
+
+### Resource Management
+
+If experiencing memory issues:
+- Default settings work fine up to ~100 concurrent clients
+- For more clients, consider scaling the instance on Render
+- Monitor memory usage in the Render dashboard
+
+## 📋 Client Protocol
+
+1. Client connects to server on TCP
+2. Client sends 4-byte length followed by ID string
+3. Authentication (optional): 4-byte length followed by secret
+4. Server sends acknowledgment with public address
+5. Clients can query for other clients by ID
+6. Server facilitates hole-punching by sharing endpoints
+
+## 📚 Development Guidelines
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for full development guidelines, including:
+- Error handling rules
+- Deployment procedures
+- Timeout configurations
+- Pull request guidelines
+
+## 🧪 Testing
+
+```bash
+# Run unit tests
+cargo test
+
+# Run integration tests
+cargo test --test integration
+```

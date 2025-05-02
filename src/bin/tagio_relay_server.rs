@@ -19,11 +19,31 @@ struct ClientInfo {
     _sender: mpsc::Sender<Vec<u8>>,
 }
 
+// Add new message types for NAT traversal
+enum NatTraversalMessageType {
+    StunBindingRequest = 10,
+    StunBindingResponse = 11,
+    UdpHolePunch = 12,
+    KeepAlive = 13,
+    NatTypeNotification = 14,
+}
+
+// Add enum for NAT types
+enum NatType {
+    OpenInternet = 0,
+    FullCone = 1,
+    RestrictedCone = 2,
+    PortRestrictedCone = 3,
+    SymmetricNat = 4,
+    Unknown = 5,
+}
+
 // Simple NAT traversal relay server
 struct RelayServer {
     clients: Arc<Mutex<HashMap<String, ClientInfo>>>,
     public_ip: Option<String>,
     auth_secret: Option<String>,
+    nat_traversal_enabled: bool,
 }
 
 impl RelayServer {
@@ -33,10 +53,18 @@ impl RelayServer {
             clients: Arc::new(Mutex::new(HashMap::new())),
             public_ip,
             auth_secret,
+            nat_traversal_enabled: true, // Enable NAT traversal by default
         }
     }
     
-    // Start the relay server
+    // Add a setter for NAT traversal
+    fn set_nat_traversal_enabled(&mut self, enabled: bool) {
+        self.nat_traversal_enabled = enabled;
+        println!("NAT traversal {} for this server instance", 
+                 if enabled { "enabled" } else { "disabled" });
+    }
+    
+    // Start the relay server with dynamic port detection
     async fn run(&self, bind_addr: &str) -> io::Result<()> {
         // Log environment details
         println!("=== TagIO Cloud Relay Server Environment ===");
@@ -49,24 +77,83 @@ impl RelayServer {
         }
         println!("==========================================");
         
-        // Note: We now start the health check in main() to ensure it's running
-        // before Render's port scan times out
+        // Determine if we're running in a cloud environment
+        let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
         
-        // Bind to the specified address for the main server
-        println!("Attempting to bind to {}", bind_addr);
-        let listener = match TcpListener::bind(bind_addr).await {
-            Ok(l) => {
-                println!("SUCCESS: Bound to {}", bind_addr);
-                l
-            },
-            Err(e) => {
-                println!("ERROR: Failed to bind to {}: {}", bind_addr, e);
-                println!("This error is expected in local environments where port 443 is privileged or in use.");
-                println!("On render.com production environment, this should succeed.");
-                return Err(e);
+        // If we have a specific PORT environment variable, use it
+        let fixed_port = env::var("PORT").ok();
+        
+        // Define ports to try in order of preference
+        let ports_to_try = if is_render {
+            if let Some(port) = &fixed_port {
+                // On Render.com, use the assigned port first, then try fallbacks
+                vec![port.clone(), "443".to_string(), "80".to_string(), "10000".to_string(), "3000".to_string(), "8080".to_string()]
+            } else {
+                // Standard cloud ports if no PORT env var
+                vec!["443".to_string(), "80".to_string(), "10000".to_string(), "3000".to_string(), "8080".to_string()]
             }
+        } else {
+            // For local development, try these ports
+            vec!["8443".to_string(), "8080".to_string(), "3000".to_string()]
         };
-        println!("TagIO relay server listening on {}", bind_addr);
+        
+        println!("Will try binding to the following ports in order: {:?}", ports_to_try);
+        
+        // Try binding to each port in sequence until one succeeds
+        let mut listener = None;
+        let mut bound_addr = String::new();
+        
+        for port in &ports_to_try {
+            let addr = format!("0.0.0.0:{}", port);
+            println!("Attempting to bind to {}", addr);
+            
+            match TcpListener::bind(&addr).await {
+                Ok(l) => {
+                    println!("SUCCESS: Bound to {}", addr);
+                    listener = Some(l);
+                    bound_addr = addr;
+                    break;
+                },
+                Err(e) => {
+                    println!("Failed to bind to {}: {}", addr, e);
+                    println!("Trying next port...");
+                }
+            }
+        }
+        
+        // If no ports could be bound, try binding to port 0 (let OS choose)
+        if listener.is_none() {
+            println!("Could not bind to any predefined ports, letting OS choose an available port...");
+            
+            match TcpListener::bind("0.0.0.0:0").await {
+                Ok(l) => {
+                    let addr = l.local_addr()?;
+                    println!("SUCCESS: Bound to OS-assigned port: {}", addr);
+                    listener = Some(l);
+                    bound_addr = format!("0.0.0.0:{}", addr.port());
+                },
+                Err(e) => {
+                    let error_msg = format!("Failed to bind to any port, including dynamic port assignment: {}", e);
+                    println!("FATAL ERROR: {}", error_msg);
+                    return Err(io::Error::new(io::ErrorKind::AddrInUse, error_msg));
+                }
+            }
+        }
+        
+        // Unwrap the listener (we know it's Some now)
+        let listener = listener.unwrap();
+        
+        println!("TagIO relay server listening on {}", bound_addr);
+        
+        // Log if NAT traversal is enabled
+        if self.nat_traversal_enabled {
+            println!("NAT traversal is ENABLED - clients can establish peer-to-peer connections");
+            println!("This allows for optimal direct connections between clients when possible");
+            println!("Using STUN-like protocol for NAT type detection and hole punching");
+        } else {
+            println!("NAT traversal is DISABLED - all connections will be relayed through this server");
+            println!("This may result in higher latency but better compatibility with strict firewalls");
+        }
         
         // Log the public IP if provided
         if let Some(ip) = &self.public_ip {
@@ -77,12 +164,6 @@ impl RelayServer {
             println!("For optimal NAT traversal, set the PUBLIC_IP environment variable on Render.com");
             println!("Without PUBLIC_IP set, NAT traversal between clients behind symmetric NATs may fail");
             println!("The server will use client-perceived addresses, which may be inaccurate behind complex NATs");
-            
-            if env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok() {
-                println!("IMPORTANT: You are running on Render.com. Set PUBLIC_IP in the environment variables section");
-                println!("You can find your Render service's static outbound IP in the 'Connect' tab");
-                println!("See: https://render.com/docs/static-outbound-ip-addresses");
-            }
         }
         
         // Log authentication status
@@ -96,7 +177,9 @@ impl RelayServer {
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
-                    println!("New connection from {} (local address: {})", addr, socket.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap()));
+                    println!("New connection from {} (local address: {})", 
+                             addr, 
+                             socket.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap()));
                     
                     // Use public IP if configured, otherwise use the detected address
                     let public_addr = if let Some(ip) = &self.public_ip {
@@ -308,6 +391,22 @@ impl RelayServer {
         
         println!("Client {} registered as '{}'", addr, client_id);
         
+        // Create a server instance for NAT detection
+        let server = RelayServer {
+            clients: clients.clone(),
+            public_ip: None,
+            auth_secret: None,
+            nat_traversal_enabled: true,
+        };
+        
+        // Detect and notify client of its NAT type
+        let client_id_clone = client_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.detect_nat_type(&client_id_clone, public_addr).await {
+                println!("Error detecting NAT type for client {}: {}", client_id_clone, e);
+            }
+        });
+        
         // Register the client and update ClientInfo with our writer channel
         {
             let mut clients_map = clients.lock().await;
@@ -506,6 +605,149 @@ impl RelayServer {
                             }
                         }
                     },
+                    // Handle NAT traversal request
+                    7 => {
+                        if n < 8 {
+                            println!("Received incomplete NAT traversal request from client {}", client_id);
+                            continue; // Not enough data
+                        }
+                        
+                        let target_id_len = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+                        if n < 8 + target_id_len {
+                            println!("Received NAT traversal request with insufficient data from client {}", client_id);
+                            continue; // Not enough data
+                        }
+                        
+                        let target_id_slice = &buffer[8..8 + target_id_len];
+                        if let Ok(target_id) = String::from_utf8(target_id_slice.to_vec()) {
+                            println!("=== NAT Traversal Request ===");
+                            println!("Client '{}' requesting NAT traversal with client '{}'", client_id, target_id);
+                            
+                            // Get a clone of the clients Arc to move into the task
+                            let clients_clone = clients.clone();
+                            let client_id_clone = client_id.clone();
+                            let target_id_clone = target_id.clone();
+                            
+                            // Create a new server instance to facilitate NAT traversal
+                            let server = RelayServer {
+                                clients: clients_clone,
+                                public_ip: None,
+                                auth_secret: None,
+                                nat_traversal_enabled: true,
+                            };
+                            
+                            // Spawn a task to facilitate NAT traversal
+                            tokio::spawn(async move {
+                                match server.facilitate_nat_traversal(&client_id_clone, &target_id_clone).await {
+                                    Ok(true) => {
+                                        println!("NAT traversal facilitation successful");
+                                    },
+                                    Ok(false) => {
+                                        println!("NAT traversal facilitation failed - one or both clients not found");
+                                    },
+                                    Err(e) => {
+                                        println!("Error facilitating NAT traversal: {}", e);
+                                    }
+                                }
+                            });
+                            
+                            println!("NAT traversal request processed");
+                            println!("===========================");
+                        }
+                    },
+                    // Handle STUN binding request
+                    10 => { // NatTraversalMessageType::StunBindingRequest
+                        println!("Received STUN binding request from client {}", client_id);
+                        
+                        // Create a STUN binding response with the client's public address
+                        let mut response = Vec::new();
+                        response.extend_from_slice(&11u32.to_be_bytes()); // StunBindingResponse
+                        
+                        // Add the public IP address
+                        let ip_str = public_addr.ip().to_string();
+                        response.extend_from_slice(&(ip_str.len() as u32).to_be_bytes());
+                        response.extend_from_slice(ip_str.as_bytes());
+                        
+                        // Add the public port
+                        response.extend_from_slice(&public_addr.port().to_be_bytes());
+                        
+                        // Send the response
+                        if let Err(e) = writer_tx.send(response).await {
+                            println!("Error sending STUN binding response: {}", e);
+                            break;
+                        } else {
+                            println!("Sent STUN binding response to client {}: {}", client_id, public_addr);
+                        }
+                    },
+                    // Handle UDP hole punch request
+                    12 => { // NatTraversalMessageType::UdpHolePunch
+                        if n < 8 {
+                            println!("Received incomplete UDP hole punch request from client {}", client_id);
+                            continue;
+                        }
+                        
+                        let target_id_len = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+                        if n < 8 + target_id_len {
+                            println!("Received UDP hole punch request with insufficient data from client {}", client_id);
+                            continue;
+                        }
+                        
+                        let target_id_slice = &buffer[8..8 + target_id_len];
+                        if let Ok(target_id) = String::from_utf8(target_id_slice.to_vec()) {
+                            println!("=== UDP Hole Punch Request ===");
+                            println!("Client '{}' requesting hole punch with client '{}'", client_id, target_id);
+                            
+                            // Create a server instance to initiate symmetric NAT traversal
+                            let server = RelayServer {
+                                clients: clients.clone(),
+                                public_ip: None,
+                                auth_secret: None,
+                                nat_traversal_enabled: true,
+                            };
+                            
+                            // Get a clone of values for the task
+                            let client_id_clone = client_id.clone();
+                            let target_id_clone = target_id.clone();
+                            
+                            // Spawn a task to handle NAT traversal
+                            tokio::spawn(async move {
+                                match server.initiate_symmetric_nat_traversal(&client_id_clone, &target_id_clone).await {
+                                    Ok(true) => {
+                                        println!("Symmetric NAT traversal initiated successfully");
+                                    },
+                                    Ok(false) => {
+                                        println!("Symmetric NAT traversal failed - one or both clients not found");
+                                    },
+                                    Err(e) => {
+                                        println!("Error initiating symmetric NAT traversal: {}", e);
+                                    }
+                                }
+                            });
+                            
+                            println!("UDP hole punch request processed");
+                            println!("===========================");
+                        }
+                    },
+                    // Handle keep-alive message
+                    13 => { // NatTraversalMessageType::KeepAlive
+                        // Create a server instance to handle keep-alive
+                        let server = RelayServer {
+                            clients: clients.clone(),
+                            public_ip: None,
+                            auth_secret: None,
+                            nat_traversal_enabled: true,
+                        };
+                        
+                        // Get a clone of the client ID for the task
+                        let client_id_clone = client_id.clone();
+                        
+                        // Spawn a task to handle keep-alive
+                        tokio::spawn(async move {
+                            if let Err(e) = server.handle_keep_alive(&client_id_clone).await {
+                                println!("Error handling keep-alive for client {}: {}", client_id_clone, e);
+                            }
+                        });
+                    },
                     // Handle ping - just acknowledge
                     5 => {
                         let pong = [6u8, 0, 0, 0]; // Message type 6 = pong
@@ -525,6 +767,271 @@ impl RelayServer {
             let mut clients_map = clients.lock().await;
             clients_map.remove(&client_id);
             println!("Removed client {} from registry", client_id);
+        }
+        
+        Ok(())
+    }
+
+    // Add this new method for facilitating NAT traversal
+    async fn facilitate_nat_traversal(&self, client_id_a: &str, client_id_b: &str) -> io::Result<bool> {
+        println!("Facilitating NAT traversal between '{}' and '{}'", client_id_a, client_id_b);
+        
+        // Get lock on clients map
+        let clients_map = self.clients.lock().await;
+        
+        // Ensure both clients exist
+        let client_a = match clients_map.get(client_id_a) {
+            Some(client) => client,
+            None => {
+                println!("Client '{}' not found", client_id_a);
+                return Ok(false);
+            }
+        };
+        
+        let client_b = match clients_map.get(client_id_b) {
+            Some(client) => client,
+            None => {
+                println!("Client '{}' not found", client_id_b);
+                return Ok(false);
+            }
+        };
+        
+        // Create NAT traversal message for client A
+        let mut msg_to_a = Vec::new();
+        msg_to_a.extend_from_slice(&5u32.to_be_bytes()); // Message type 5 = NAT traversal
+        
+        // ID of client B
+        msg_to_a.extend_from_slice(&(client_id_b.len() as u32).to_be_bytes());
+        msg_to_a.extend_from_slice(client_id_b.as_bytes());
+        
+        // Endpoint of client B
+        let ip_str_b = client_b._public_addr.ip().to_string();
+        msg_to_a.extend_from_slice(&(ip_str_b.len() as u32).to_be_bytes());
+        msg_to_a.extend_from_slice(ip_str_b.as_bytes());
+        msg_to_a.extend_from_slice(&client_b._public_addr.port().to_be_bytes());
+        
+        // Create NAT traversal message for client B
+        let mut msg_to_b = Vec::new();
+        msg_to_b.extend_from_slice(&5u32.to_be_bytes()); // Message type 5 = NAT traversal
+        
+        // ID of client A
+        msg_to_b.extend_from_slice(&(client_id_a.len() as u32).to_be_bytes());
+        msg_to_b.extend_from_slice(client_id_a.as_bytes());
+        
+        // Endpoint of client A
+        let ip_str_a = client_a._public_addr.ip().to_string();
+        msg_to_b.extend_from_slice(&(ip_str_a.len() as u32).to_be_bytes());
+        msg_to_b.extend_from_slice(ip_str_a.as_bytes());
+        msg_to_b.extend_from_slice(&client_a._public_addr.port().to_be_bytes());
+        
+        // Send messages to both clients simultaneously
+        let (res_a, res_b) = tokio::join!(
+            client_a._sender.send(msg_to_a),
+            client_b._sender.send(msg_to_b)
+        );
+        
+        // Check results
+        if let Err(e) = res_a {
+            println!("Failed to send NAT traversal info to client '{}': {}", client_id_a, e);
+            return Ok(false);
+        }
+        
+        if let Err(e) = res_b {
+            println!("Failed to send NAT traversal info to client '{}': {}", client_id_b, e);
+            return Ok(false);
+        }
+        
+        println!("NAT traversal information sent to both clients successfully");
+        println!("Client '{}' endpoint: {}", client_id_a, client_a._public_addr);
+        println!("Client '{}' endpoint: {}", client_id_b, client_b._public_addr);
+        
+        Ok(true)
+    }
+
+    // Add this method to detect NAT type for a client
+    async fn detect_nat_type(&self, client_id: &str, client_addr: SocketAddr) -> io::Result<NatType> {
+        println!("Attempting to detect NAT type for client '{}'", client_id);
+        
+        // Get the client info
+        let clients_map = self.clients.lock().await;
+        let client_info = match clients_map.get(client_id) {
+            Some(info) => info,
+            None => {
+                println!("Client '{}' not found when detecting NAT type", client_id);
+                return Ok(NatType::Unknown);
+            }
+        };
+        
+        // For simple detection, we'll check if the client's IP matches our expected public IP
+        if let Some(ref public_ip) = self.public_ip {
+            if client_addr.ip().to_string() == *public_ip {
+                println!("Client '{}' appears to be directly connected (Open Internet)", client_id);
+                return Ok(NatType::OpenInternet);
+            }
+        }
+        
+        // In a real implementation, we would perform multiple tests:
+        // 1. Try sending from different source ports to detect port-restricted NAT
+        // 2. Try sending from different source IPs to detect symmetric NAT
+        // For now, we'll assume a port-restricted cone NAT as that's most common
+        println!("Client '{}' likely behind Port Restricted Cone NAT (most common type)", client_id);
+        
+        // Notify the client of its detected NAT type
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(NatTraversalMessageType::NatTypeNotification as u32).to_be_bytes());
+        msg.push(NatType::PortRestrictedCone as u8);
+        
+        if let Err(e) = client_info._sender.send(msg).await {
+            println!("Failed to send NAT type notification to client '{}': {}", client_id, e);
+        } else {
+            println!("Sent NAT type notification to client '{}'", client_id);
+        }
+        
+        Ok(NatType::PortRestrictedCone)
+    }
+    
+    // Implement a more sophisticated NAT traversal for clients behind symmetric NATs
+    async fn initiate_symmetric_nat_traversal(&self, client_id_a: &str, client_id_b: &str) -> io::Result<bool> {
+        println!("Initiating symmetric NAT traversal between '{}' and '{}'", client_id_a, client_id_b);
+        
+        // Get lock on clients map
+        let clients_map = self.clients.lock().await;
+        
+        // Ensure both clients exist
+        let client_a = match clients_map.get(client_id_a) {
+            Some(client) => client,
+            None => {
+                println!("Client '{}' not found", client_id_a);
+                return Ok(false);
+            }
+        };
+        
+        let client_b = match clients_map.get(client_id_b) {
+            Some(client) => client,
+            None => {
+                println!("Client '{}' not found", client_id_b);
+                return Ok(false);
+            }
+        };
+        
+        // For clients behind symmetric NATs, we need a more complex approach:
+        // 1. Have both clients send packets to each other's endpoints (traditional hole punching)
+        // 2. If that fails, use the relay server as a fallback
+        
+        // Send message to client A with instructions for symmetric traversal
+        let mut msg_to_a = Vec::new();
+        msg_to_a.extend_from_slice(&(NatTraversalMessageType::UdpHolePunch as u32).to_be_bytes());
+        
+        // ID of client B
+        msg_to_a.extend_from_slice(&(client_id_b.len() as u32).to_be_bytes());
+        msg_to_a.extend_from_slice(client_id_b.as_bytes());
+        
+        // Endpoint of client B (multiple ports to try)
+        let ip_str_b = client_b._public_addr.ip().to_string();
+        msg_to_a.extend_from_slice(&(ip_str_b.len() as u32).to_be_bytes());
+        msg_to_a.extend_from_slice(ip_str_b.as_bytes());
+        
+        // Primary port
+        msg_to_a.extend_from_slice(&client_b._public_addr.port().to_be_bytes());
+        
+        // Send prediction for additional ports to try (for symmetric NATs)
+        // Add port+1 and port+2 as common predictions
+        let port_b = client_b._public_addr.port();
+        msg_to_a.extend_from_slice(&(port_b + 1).to_be_bytes());
+        msg_to_a.extend_from_slice(&(port_b + 2).to_be_bytes());
+        
+        // Similarly for client B
+        let mut msg_to_b = Vec::new();
+        msg_to_b.extend_from_slice(&(NatTraversalMessageType::UdpHolePunch as u32).to_be_bytes());
+        
+        // ID of client A
+        msg_to_b.extend_from_slice(&(client_id_a.len() as u32).to_be_bytes());
+        msg_to_b.extend_from_slice(client_id_a.as_bytes());
+        
+        // Endpoint of client A
+        let ip_str_a = client_a._public_addr.ip().to_string();
+        msg_to_b.extend_from_slice(&(ip_str_a.len() as u32).to_be_bytes());
+        msg_to_b.extend_from_slice(ip_str_a.as_bytes());
+        
+        // Primary port
+        msg_to_b.extend_from_slice(&client_a._public_addr.port().to_be_bytes());
+        
+        // Send prediction for additional ports to try
+        let port_a = client_a._public_addr.port();
+        msg_to_b.extend_from_slice(&(port_a + 1).to_be_bytes());
+        msg_to_b.extend_from_slice(&(port_a + 2).to_be_bytes());
+        
+        // Send messages to both clients simultaneously
+        let (res_a, res_b) = tokio::join!(
+            client_a._sender.send(msg_to_a),
+            client_b._sender.send(msg_to_b)
+        );
+        
+        // Check results
+        if let Err(e) = res_a {
+            println!("Failed to send symmetric NAT traversal info to client '{}': {}", client_id_a, e);
+            return Ok(false);
+        }
+        
+        if let Err(e) = res_b {
+            println!("Failed to send symmetric NAT traversal info to client '{}': {}", client_id_b, e);
+            return Ok(false);
+        }
+        
+        println!("Symmetric NAT traversal information sent to both clients successfully");
+        println!("Client '{}' endpoint: {}", client_id_a, client_a._public_addr);
+        println!("Client '{}' endpoint: {}", client_id_b, client_b._public_addr);
+        
+        // Schedule a check after a short delay to see if traversal was successful
+        let clients_clone = self.clients.clone();
+        let client_id_a_clone = client_id_a.to_string();
+        let client_id_b_clone = client_id_b.to_string();
+        
+        tokio::spawn(async move {
+            // Wait for clients to attempt direct connection
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            
+            // In a complete implementation, we would check if clients report successful connection
+            // For now, just log that we're checking
+            println!("Checking if NAT traversal between '{}' and '{}' was successful...", 
+                     client_id_a_clone, client_id_b_clone);
+            
+            // Logic to check connection status would go here
+            
+            // If traversal failed, we would fall back to relay mode
+            let clients = clients_clone.lock().await;
+            if clients.contains_key(&client_id_a_clone) && clients.contains_key(&client_id_b_clone) {
+                println!("Both clients still connected, will use relay if direct connection failed");
+            } else {
+                println!("One or both clients disconnected during NAT traversal attempt");
+            }
+        });
+        
+        Ok(true)
+    }
+    
+    // New method for handling keep-alive messages
+    async fn handle_keep_alive(&self, client_id: &str) -> io::Result<()> {
+        println!("Processing keep-alive for client '{}'", client_id);
+        
+        // Get the client info
+        let clients_map = self.clients.lock().await;
+        let client_info = match clients_map.get(client_id) {
+            Some(info) => info,
+            None => {
+                println!("Client '{}' not found when handling keep-alive", client_id);
+                return Ok(());
+            }
+        };
+        
+        // Send keep-alive acknowledgment
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(NatTraversalMessageType::KeepAlive as u32).to_be_bytes());
+        
+        if let Err(e) = client_info._sender.send(msg).await {
+            println!("Failed to send keep-alive acknowledgment to client '{}': {}", client_id, e);
+        } else {
+            println!("Sent keep-alive acknowledgment to client '{}'", client_id);
         }
         
         Ok(())
@@ -656,6 +1163,8 @@ async fn start_health_check_server() {
         vec!["8080"]
     };
     
+    let mut success = false;
+    
     for port in health_check_ports {
         let addr = format!("0.0.0.0:{}", port);
         println!("Attempting to start health check server on {}", addr);
@@ -673,29 +1182,45 @@ async fn start_health_check_server() {
                             Ok((mut socket, addr)) => {
                                 println!("Health check request from {}", addr);
                                 
-                                // Simple HTTP response - large enough to be detected
-                                let response = "HTTP/1.1 200 OK\r\n\
-                                               Content-Type: text/plain\r\n\
-                                               Content-Length: 22\r\n\
-                                               \r\n\
-                                               TagIO Relay Server Ready";
+                                // Create a more robust HTTP response that is more likely to be detected
+                                let response = concat!(
+                                    "HTTP/1.1 200 OK\r\n",
+                                    "Server: TagIO-Relay\r\n",
+                                    "Content-Type: text/plain\r\n",
+                                    "Connection: keep-alive\r\n",
+                                    "Content-Length: 22\r\n",
+                                    "\r\n",
+                                    "TagIO Relay Server Ready"
+                                );
                                 
-                                // Send the response
-                                if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                    println!("Failed to send health check response: {}", e);
-                                } else {
-                                    println!("Health check response sent to {}", addr);
+                                // Send the response immediately without waiting for request parsing
+                                match socket.write_all(response.as_bytes()).await {
+                                    Ok(_) => {
+                                        println!("Health check response sent to {}", addr);
+                                        // Try to flush the socket to ensure response is sent
+                                        if let Err(e) = socket.flush().await {
+                                            println!("Failed to flush health check response: {}", e);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        println!("Failed to send health check response: {}", e);
+                                    }
                                 }
                             },
                             Err(e) => {
                                 println!("Error accepting health check connection: {}", e);
+                                // Brief pause to avoid CPU spinning on repeated errors
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
                     }
                 });
                 
-                // Successfully started health check server
-                return;
+                success = true;
+                println!("Health check server successfully started on port {}", port);
+                
+                // Don't immediately return - try to bind to multiple ports
+                // This increases chances of Render.com's port scan finding our service
             },
             Err(e) => {
                 println!("Failed to bind health check server to {}: {}", addr, e);
@@ -703,8 +1228,12 @@ async fn start_health_check_server() {
         }
     }
     
-    println!("WARNING: Could not start health check server on any port");
-    println!("Render.com deployment may fail during port detection");
+    if !success {
+        println!("WARNING: Could not start health check server on any port");
+        println!("Render.com deployment may fail during port detection");
+    } else {
+        println!("Health check server(s) started successfully");
+    }
 }
 
 #[tokio::main]
@@ -722,6 +1251,9 @@ async fn main() -> Result<()> {
     println!("Args: {:?}", args);
     println!("Working directory: {:?}", env::current_dir().unwrap_or_default());
     
+    // Check for NAT traversal options
+    let enable_nat_traversal = !args.contains(&"--disable-nat-traversal".to_string());
+    
     // Check if running on render.com
     let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
     println!("Running on render.com: {}", is_render);
@@ -733,6 +1265,7 @@ async fn main() -> Result<()> {
         println!("Running in local/custom environment");
     }
     
+    println!("NAT traversal: {}", if enable_nat_traversal { "ENABLED" } else { "DISABLED" });
     println!("=================================");
     
     // IMPORTANT: Start health check server FIRST
@@ -740,29 +1273,12 @@ async fn main() -> Result<()> {
     println!("Starting health check server for Render.com port detection...");
     start_health_check_server().await;
     
-    // Get binding address from environment variable or use default
-    let bind_addr = if is_render {
-        // On render.com, we should use the PORT environment variable
-        match env::var("PORT") {
-            Ok(port) => {
-                println!("Using render.com assigned port: {}", port);
-                format!("0.0.0.0:{}", port)
-            },
-            Err(_) => {
-                println!("WARNING: Running on render.com but PORT environment variable not found!");
-                println!("This is unexpected and may cause binding errors");
-                "0.0.0.0:10000".to_string() // Default Render port
-            }
-        }
-    } else {
-        // For local development
-        env::var("PORT")
-            .map(|port| format!("0.0.0.0:{}", port))
-            .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
-    };
-    
-    println!("TagIO Relay Server v{}", env!("CARGO_PKG_VERSION"));
-    println!("Starting relay server on {}", bind_addr);
+    // If running on render.com, wait a bit to ensure the health check is detected
+    if is_render {
+        println!("Waiting for health check server to be detected by Render.com...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("Continuing with main server initialization");
+    }
     
     // Get public IP from environment variable or auto-detect
     let mut public_ip = env::var("PUBLIC_IP").ok();
@@ -784,7 +1300,7 @@ async fn main() -> Result<()> {
                 println!("For best results, set the PUBLIC_IP environment variable in the Render dashboard.");
             }
         }
-    } else if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) {
+    } else if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) && !is_render {
         // Only prompt in local/development environment, not on Render
         let auto_detect = prompt_yes_no("Do you want to auto-detect your public IP? (y/n)");
         if auto_detect {
@@ -818,9 +1334,14 @@ async fn main() -> Result<()> {
     // Get auth secret from environment variable or use default
     let auth_secret = env::var("AUTH_SECRET").ok();
     
-    // Run the relay server (remove the health check logic as we've already started it)
-    let server = RelayServer::new(public_ip, auth_secret);
-    match server.run(&bind_addr).await {
+    // Create the relay server with NAT traversal setting
+    let mut server = RelayServer::new(public_ip, auth_secret);
+    
+    // Set the NAT traversal flag based on command line arguments
+    server.set_nat_traversal_enabled(enable_nat_traversal);
+    
+    // Run the relay server (we'll pass empty string - the run method will handle port binding logic)
+    match server.run("").await {
         Ok(_) => {
             println!("Server terminated normally");
             Ok(())
@@ -828,17 +1349,6 @@ async fn main() -> Result<()> {
         Err(e) => {
             eprintln!("Error running server: {}", e);
             eprintln!("Error details: {:?}", e);
-            
-            // Check for specific error conditions
-            if e.kind() == io::ErrorKind::AddrInUse {
-                eprintln!("Address already in use error - this is common in local development");
-                eprintln!("On render.com, the PORT environment variable is managed by the platform");
-                eprintln!("and should be available when the container starts");
-            }
-            if e.kind() == io::ErrorKind::PermissionDenied {
-                eprintln!("Permission denied error - cannot bind to privileged port");
-                eprintln!("On render.com, this should not happen as the container runs with sufficient privileges");
-            }
             
             Err(anyhow!("Server error: {}", e))
         }

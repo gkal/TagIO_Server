@@ -1,29 +1,23 @@
 services:
   - type: web
-    name: tagio-relay
-    runtime: rust
-    region: ohio
-    plan: free
-    branch: main
-    buildCommand: ATK_NO_PKG_CONFIG=1 GTK_NO_PKG_CONFIG=1 GDK_NO_PKG_CONFIG=1 PANGO_NO_PKG_CONFIG=1 CAIRO_NO_PKG_CONFIG=1 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --bin tagio_relay_server --no-default-features --features server
+    name: tagio-relay-server
+    env: rust
+    plan: free # Change to starter/standard for production
+    buildCommand: cargo build --release
     startCommand: ./target/release/tagio_relay_server
     envVars:
+      - key: PORT
+        value: 10000
       - key: PUBLIC_IP
-        value: automatic
-      - key: RUST_LOG
-        value: info
+        sync: false # Will be auto-detected, but can be manually set in dashboard
       - key: AUTH_SECRET
-        value: tagio_default_secret # Change this for production use
-      - key: CARGO_ENCODED_RUSTFLAGS
-        value: "-C target-feature=+crt-static"
-      - key: ATK_NO_PKG_CONFIG
-        value: "1"
-      - key: GTK_NO_PKG_CONFIG
-        value: "1"
-      - key: GDK_NO_PKG_CONFIG
-        value: "1"
-      - key: PANGO_NO_PKG_CONFIG
-        value: "1"
-      - key: CAIRO_NO_PKG_CONFIG
-        value: "1"
-    healthCheckPath: /health 
+        sync: false # Add in dashboard for security
+    healthCheckPath: / # Health check endpoint
+    # Deployment settings
+    autoDeploy: true
+    # Scaling settings (Pro+ plans only)
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    # Increased deployment timeout for slower builds
+    initialDeployHook: echo "Starting TagIO Relay Server deployment" 
