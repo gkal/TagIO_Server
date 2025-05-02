@@ -25,8 +25,8 @@ services:
     initialDeployHook: echo "Starting TagIO Relay Server deployment"
     # Configure TCP proxy instead of HTTP proxy
     tcpPorts:
-      - port: 10000
+      - port: 443
         name: tagio
         proxy:
-          port: 443
+          port: 10000
           protocol: tcp 
