@@ -13,9 +13,11 @@ pub const MAX_PORT_PREDICTION_RANGE: u16 = 10;
 pub const FALLBACK_PORT: u16 = 443;
 
 // Health check server port
-pub const HEALTH_CHECK_PORT: u16 = 8888;
+#[allow(dead_code)]
+pub const HEALTH_CHECK_PORT: u16 = 8080;
 
 // Ensure we also listen on TCP port 80, standard HTTP port
+#[allow(dead_code)]
 pub const HTTP_PORT: u16 = 80;
 
 // Cloud server's public IP address - used for NAT traversal

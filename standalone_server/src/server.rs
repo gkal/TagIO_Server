@@ -394,10 +394,10 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
         let mut client_id = String::new();
         let mut authenticated = false;
         let mut _version_checked = false;
-        let mut protocol_verified = false; // Add flag to track if protocol has been verified
+        let mut protocol_verified = false; // Track if we've verified this is a TagIO protocol client
         
         if !is_local {
-            info!("PROTOCOL CHECK: Waiting for client {} to identify protocol", addr);
+            debug!("Waiting for client {} to identify protocol", addr);
         }
         
         // Process messages from the client
@@ -405,34 +405,26 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
             // Read with timeout to detect dead connections
             match timeout(KEEP_ALIVE_TIMEOUT, read.read(&mut buffer)).await {
                 Ok(Ok(0)) => {
-                    // Connection closed by client
-                    if !is_local {
-                        println!("===== CLIENT DISCONNECTED: {} =====", addr);
-                        debug!("Client {} disconnected", addr);
-                    }
+                    // Connection closed
+                    info!("Connection closed by client {}", addr);
                     break;
                 },
                 Ok(Ok(n)) => {
-                    if !is_local {
-                        println!("===== RECEIVED DATA: {} bytes from {} =====", n, addr);
-                    }
-                    // Check for HTTP request (clients sometimes try HTTP first)
+                    // Check for HTTP request immediately (clients sometimes try HTTP first)
                     if !authenticated && (
                         buffer.starts_with(b"GET ") || 
                         buffer.starts_with(b"POST ") || 
                         buffer.starts_with(b"HTTP") ||
-                        // Also detect other common HTTP methods
                         buffer.starts_with(b"HEAD ") ||
                         buffer.starts_with(b"PUT ") ||
                         buffer.starts_with(b"DELETE ") ||
                         buffer.starts_with(b"OPTIONS ")
                     ) {
+                        // This is an HTTP request, not a TagIO protocol message
                         if !is_local {
-                            info!("PROTOCOL DETECTED: HTTP client from {}, immediately dropping connection", addr);
-                            println!("===== DROPPED: HTTP client connection from {} =====", addr);
+                            info!("Received HTTP request from {}. Dropping connection without response.", addr);
                         }
-                        
-                        // Immediately drop HTTP connections without sending any response
+                        // Silently drop the connection without sending a response
                         break;
                     }
 
@@ -480,13 +472,16 @@ CLIENT NOTE: Connect to tagio.onrender.com:443 using TagIO protocol
                         if !protocol_verified {
                             protocol_verified = true;
                             
-                            // Now that we've verified it's a TagIO client, send version check
-                            if let Err(e) = control_tx.send(NatMessage::VersionCheck { version: PROTOCOL_VERSION }).await {
-                                if !is_local {
-                                    println!("===== ERROR: Failed to send version check to {} =====", addr);
-                                    error!("Failed to send version check to {}: {}", addr, e);
+                            if !is_local {
+                                info!("Valid TagIO protocol client detected from {}", addr);
+                                
+                                // Send version check message after confirming TagIO protocol
+                                if let Err(e) = control_tx.send(NatMessage::VersionCheck { 
+                                    version: PROTOCOL_VERSION 
+                                }).await {
+                                    error!("Failed to send version check message: {}", e);
+                                    break;
                                 }
-                                break;
                             }
                         }
                         
@@ -1080,6 +1075,7 @@ fn is_localhost(addr: &SocketAddr) -> bool {
 }
 
 // Helper function to detect HTTP protocol
+#[allow(dead_code)]
 fn is_http_protocol(data: &[u8]) -> bool {
     // Check for common HTTP request methods
     if data.len() < 4 {
