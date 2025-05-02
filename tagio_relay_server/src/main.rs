@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::io::{self, Write};
 use std::str::FromStr;
 use anyhow::{Result, anyhow};
-use log::{info, error};
+use log::info;
 use clap::{Parser, ArgAction};
 
 mod constants;

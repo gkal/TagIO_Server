@@ -44,7 +44,8 @@ impl RelayServer {
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
         // Start the health check endpoint on port 8080
         let health_check_addr = format!("0.0.0.0:{}", HEALTH_CHECK_PORT);
-        let health_check_server = Self::run_health_check(&health_check_addr);
+        // Pass the health_check_addr as an owned String to avoid lifetime issues
+        let health_check_server = Self::run_health_check(health_check_addr);
         
         // Bind to the specified address for the main server
         let listener = TcpListener::bind(bind_addr).await?;
@@ -403,8 +404,8 @@ impl RelayServer {
     }
     
     /// Run a simple health check HTTP server
-    async fn run_health_check(addr: &str) -> Result<()> {
-        let listener = match TcpListener::bind(addr).await {
+    async fn run_health_check(addr: String) -> Result<()> {
+        let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
                 error!("Failed to bind health check server: {}", e);
