@@ -1,22 +1,40 @@
+#[cfg(feature = "client")]
 use anyhow::{Result, Context};
+#[cfg(not(feature = "client"))]
+use anyhow::Result;
+
+#[cfg(feature = "client")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{mpsc, Mutex},
     time::{self, Duration},
 };
+#[cfg(not(feature = "client"))]
+use tokio::{net::TcpStream, sync::mpsc};
+
+#[cfg(feature = "client")]
 use aes_gcm::Nonce;
+#[cfg(feature = "client")]
 use rand::Rng;
+#[cfg(feature = "client")]
 use std::sync::Arc;
+#[cfg(feature = "client")]
 use log::{debug, info, error};
 
+#[cfg(feature = "client")]
 use crate::screen_capture::{self, ScreenCapture};
+#[cfg(feature = "client")]
 use crate::input;
+#[cfg(feature = "client")]
 use crate::network_speed::{SharedNetworkSpeed, QualityLevel};
+#[cfg(feature = "client")]
 use crate::streaming::protocol::{ClientMessage, ServerMessage};
+#[cfg(feature = "client")]
 use crate::streaming::encryption::{create_cipher, encrypt, decrypt, get_encryption_key_id};
 
 /// Run the server side (screen sharing)
+#[cfg(feature = "client")]
 pub async fn run_server(
     stream: TcpStream, 
     _frame_tx: mpsc::Sender<(Vec<u8>, u32, u32)>
@@ -364,5 +382,15 @@ pub async fn run_server(
     
     info!("Shutting down screen sharing server");
     
+    Ok(())
+}
+
+// Empty implementation for server-only builds
+#[cfg(not(feature = "client"))]
+pub async fn run_server(
+    _stream: TcpStream, 
+    _frame_tx: mpsc::Sender<(Vec<u8>, u32, u32)>
+) -> Result<()> {
+    log::warn!("Screen capture not available in server-only build");
     Ok(())
 } 

@@ -23,10 +23,48 @@ The client has been automatically configured to use the new Render server. The d
 
 If you need to manually update the relay server:
 
-1. Edit your configuration at `~/.tagio/config.json`
-2. Change the `relay_server` value to `tagio.onrender.com:443`
-3. Make sure `secure_mode` is set to `true`
-4. Ensure `auth_token` matches the server's authentication secret
+1. Edit your configuration file
+2. Set `relay_server` to `tagio.onrender.com:443`
+
+## Optimizations
+
+The build process has been optimized to reduce dependencies:
+
+1. Feature flags have been added to separate client and server code
+2. The server now builds without GUI dependencies (no GTK/eframe)
+3. Server binary size has been reduced to ~1.1MB
+
+## Deployment Options
+
+### Deploy on Render
+
+The `render.yaml` file in the repository configures automatic deployment to Render.com.
+
+### Docker Deployment
+
+A Dockerfile is included for containerized deployment:
+
+```bash
+# Build the Docker image
+docker build -t tagio-relay .
+
+# Run the container
+docker run -p 443:443 -p 8080:8080 -e AUTH_SECRET=your_secret_key tagio-relay
+```
+
+### Manual Build
+
+To build the server without GUI dependencies:
+
+```bash
+cargo build --release --bin tagio_relay_server --no-default-features --features server
+```
+
+Or use the provided build script:
+
+```bash
+./build_optimized.ps1
+```
 
 ## Benefits of the Render Deployment
 

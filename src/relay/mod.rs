@@ -2,7 +2,7 @@
 // Explicitly allow unused_imports here to silence warnings caused by re-exports in lib.rs
 #![allow(unused_imports)]
 
-mod constants;
+pub mod constants;
 mod messages;
 mod server;
 mod client;

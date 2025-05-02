@@ -5,7 +5,7 @@ services:
     region: ohio
     plan: free
     branch: main
-    buildCommand: cargo build --release --bin tagio_relay_server
+    buildCommand: RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --bin tagio_relay_server --no-default-features --features server
     startCommand: ./target/release/tagio_relay_server
     envVars:
       - key: PUBLIC_IP
@@ -14,4 +14,6 @@ services:
         value: info
       - key: AUTH_SECRET
         value: tagio_default_secret # Change this for production use
+      - key: CARGO_ENCODED_RUSTFLAGS
+        value: "-C target-feature=+crt-static"
     healthCheckPath: /health 

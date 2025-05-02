@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 mod communication;
-mod client;
+pub mod client;
 mod server;
 mod nat_client;
 
