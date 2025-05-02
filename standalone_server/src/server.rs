@@ -48,6 +48,8 @@ pub struct RelayServer {
     public_ip: Option<String>, // Store the server's public IP address
     auth_secret: String, // Authentication secret
     unauthorized_attempts: Arc<AtomicUsize>, // Track unauthorized connection attempts
+    nat_traversal_enabled: bool, // Whether NAT traversal is enabled
+    protocol_detection_enabled: bool, // Whether protocol detection is enabled
 }
 
 impl RelayServer {
@@ -58,7 +60,19 @@ impl RelayServer {
             public_ip,
             auth_secret: auth_secret.unwrap_or_else(|| DEFAULT_AUTH_SECRET.to_string()),
             unauthorized_attempts: Arc::new(AtomicUsize::new(0)),
+            nat_traversal_enabled: true,
+            protocol_detection_enabled: false,
         }
+    }
+    
+    // Set whether NAT traversal is enabled
+    pub fn set_nat_traversal_enabled(&mut self, enabled: bool) {
+        self.nat_traversal_enabled = enabled;
+    }
+    
+    // Set whether protocol detection is enabled
+    pub fn set_protocol_detection(&mut self, enabled: bool) {
+        self.protocol_detection_enabled = enabled;
     }
     
     // Run the server and start accepting connections

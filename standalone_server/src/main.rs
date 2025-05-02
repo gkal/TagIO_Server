@@ -154,6 +154,10 @@ struct CliArgs {
     /// Disable NAT traversal (relay mode only)
     #[clap(long, action = ArgAction::SetTrue)]
     relay_only: bool,
+    
+    /// Enable protocol detection to handle both HTTP and TagIO traffic on the same port
+    #[clap(long, action = ArgAction::SetTrue)]
+    enable_protocol_detection: bool,
 }
 
 /// Prompt for user input with a given message
@@ -423,9 +427,25 @@ async fn main() -> Result<()> {
     info!("==========================================");
     
     // Create server with cloned values
-    let server = RelayServer::new(public_ip.clone(), auth_secret.clone());
+    let mut server = RelayServer::new(public_ip.clone(), auth_secret.clone());
+    
+    // Set protocol detection flag
+    if args.enable_protocol_detection {
+        println!("PROTOCOL: Enabling protocol detection for distinguishing HTTP and TagIO traffic");
+        info!("Protocol detection enabled for mixed HTTP/TagIO traffic on port 80");
+        server.set_protocol_detection(true);
+    }
     
     // Run the server
+    if args.relay_only {
+        server.set_nat_traversal_enabled(false);
+        println!("NAT Traversal: DISABLED - relay only mode");
+        info!("NAT traversal disabled - running in relay-only mode");
+    } else {
+        println!("NAT Traversal: ENABLED");
+        info!("NAT Traversal: ENABLED");
+    }
+    
     server.run(&bind_addr).await?;
     
     Ok(())
