@@ -61,6 +61,7 @@ impl RelayServer {
     
     // Run the server and start accepting connections
     pub async fn run(&self, bind_addr: &str) -> Result<()> {
+        println!("STARTING SERVER: Binding to {}", bind_addr);
         info!("Starting NAT traversal relay server...");
         info!("This server is designed to run on tagio-server.onrender.com");
         
@@ -147,6 +148,7 @@ impl RelayServer {
     // Start a health check HTTP server that can be used by cloud providers to verify the service is running
     async fn start_health_check_server(base_ip: String) -> Result<()> {
         info!("Starting health check HTTP server...");
+        println!("HEALTH: Starting health check server on ports {:?}", HEALTH_CHECK_PORTS);
         
         // Try each port in sequence
         for port in HEALTH_CHECK_PORTS.iter() {
@@ -154,6 +156,7 @@ impl RelayServer {
             match TcpListener::bind(&addr).await {
                 Ok(listener) => {
                     info!("Health check server successfully bound to {}", addr);
+                    println!("HEALTH: Server bound to port {}", port);
                     
                     // Spawn the health check server loop
                     tokio::spawn(async move {
@@ -170,12 +173,13 @@ impl RelayServer {
                                         match socket.read(&mut buffer).await {
                                             Ok(n) if n > 0 => {
                                                 // Simple HTTP server that responds to any request with 200 OK
-                                                let response = "HTTP/1.1 200 OK\r\n\
+                                                let response_body = "TagIO Relay Server v0.2.1 Healthy (Render)";
+                                                let response = format!("HTTP/1.1 200 OK\r\n\
                                                                Content-Type: text/plain\r\n\
-                                                               Content-Length: 36\r\n\
+                                                               Content-Length: {}\r\n\
                                                                Connection: close\r\n\
                                                                \r\n\
-                                                               TagIO Relay Server Healthy (Render)";
+                                                               {}", response_body.len(), response_body);
                                                 
                                                 if let Err(e) = socket.write_all(response.as_bytes()).await {
                                                     error!("Failed to send health check response: {}", e);
@@ -203,17 +207,21 @@ impl RelayServer {
                 },
                 Err(e) => {
                     warn!("Failed to bind health check server to {}: {}", addr, e);
+                    println!("HEALTH: Failed to bind to port {} - trying next port", port);
                     // Continue with next port
                 }
             }
         }
         
         warn!("Failed to start health check server on any port");
-        Ok(()) // Don't fail the main server just because health check failed
+        println!("HEALTH WARNING: Could not bind to any health check ports");
+        // Don't fail the main server just because health check failed
+        Ok(())
     }
     
     // Handle a client connection
     async fn handle_client(&self, socket: TcpStream, addr: SocketAddr) -> Result<()> {
+        println!("CLIENT: New connection from {}", addr);
         trace!("Handling new client connection from {}", addr);
         
         let peer_addr = socket.peer_addr()?;
@@ -269,6 +277,20 @@ impl RelayServer {
                     
                     // Process normal client messages
                     if let Some(message) = control_rx.recv().await {
+                        // Only print auth-related messages to reduce output
+                        match &message {
+                            NatMessage::Authenticate { client_id, .. } => {
+                                println!("AUTH: Attempt from client {} at {}", client_id, addr);
+                            },
+                            NatMessage::AuthAck { .. } => {
+                                println!("AUTH: Success response to {}", addr);
+                            },
+                            NatMessage::AuthError { .. } => {
+                                println!("AUTH: Failure response to {}", addr);
+                            },
+                            _ => {} // Don't log other message types
+                        }
+                        
                         trace!("Sending message to {}: {:?}", addr, message);
                         match bincode::serialize(&message) {
                             Ok(data) => {
@@ -281,21 +303,29 @@ impl RelayServer {
                                 let message_len = message_data.len() as u32;
                                 let len_bytes = message_len.to_be_bytes(); // Big-endian (network) byte order
                                 
+                                println!("===== SENDING DATA: length prefix {} bytes + message {} bytes to {} =====", 
+                                    len_bytes.len(), message_data.len(), addr);
+                                
                                 // First write the length prefix
                                 if let Err(e) = write.write_all(&len_bytes).await {
+                                    println!("===== ERROR: Failed to write length prefix to {} =====", addr);
                                     error!("Error writing length prefix to client {}: {}", addr, e);
                                     break;
                                 }
                                 
                                 // Then write the actual message (magic bytes + serialized data)
                                 if let Err(e) = write.write_all(&message_data).await {
+                                    println!("===== ERROR: Failed to write message to {} =====", addr);
                                     error!("Error writing message to client {}: {}", addr, e);
                                     break;
                                 }
                                 
+                                println!("===== SENT SUCCESSFULLY: {} bytes to {} =====", 
+                                    len_bytes.len() + message_data.len(), addr);
                                 trace!("Successfully sent message with length {} to {}", message_len, addr);
                             }
                             Err(e) => {
+                                println!("ERROR: Serialization failed for {}: {}", addr, e);
                                 error!("Error serializing message for {}: {}", addr, e);
                                 break;
                             }
@@ -308,6 +338,7 @@ impl RelayServer {
         
         // Send version check message immediately upon connection
         if let Err(e) = control_tx.send(NatMessage::VersionCheck { version: PROTOCOL_VERSION }).await {
+            println!("===== ERROR: Failed to send version check to {} =====", addr);
             error!("Failed to send version check to {}: {}", addr, e);
             return Err(anyhow!("Failed to send version check"));
         }
@@ -326,10 +357,12 @@ impl RelayServer {
             match timeout(KEEP_ALIVE_TIMEOUT, read.read(&mut buffer)).await {
                 Ok(Ok(0)) => {
                     // Connection closed by client
+                    println!("===== CLIENT DISCONNECTED: {} =====", addr);
                     debug!("Client {} disconnected", addr);
                     break;
                 },
                 Ok(Ok(n)) => {
+                    println!("===== RECEIVED DATA: {} bytes from {} =====", n, addr);
                     // Check for HTTP request (clients sometimes try HTTP first)
                     if !authenticated && (
                         buffer.starts_with(b"GET ") || 
@@ -342,264 +375,318 @@ impl RelayServer {
                         buffer.starts_with(b"OPTIONS ")
                     ) {
                         info!("PROTOCOL DETECTED: HTTP client from {}, sending health response", addr);
-                        let response = "HTTP/1.1 200 OK\r\n\
-                                       Content-Type: text/plain\r\n\
-                                       Content-Length: 36\r\n\
-                                       Connection: close\r\n\
-                                       \r\n\
-                                       TagIO Relay Server Healthy (Render)";
-                        if let Err(e) = http_tx.send(response.to_string()).await {
+                        let response_body = "TagIO Relay Server v0.2.1 Healthy (Render)";
+                        let response = format!("HTTP/1.1 200 OK\r\n\
+                                               Content-Type: text/plain\r\n\
+                                               Content-Length: {}\r\n\
+                                               Connection: close\r\n\
+                                               \r\n\
+                                               {}", response_body.len(), response_body);
+                        if let Err(e) = http_tx.send(response).await {
                             error!("Failed to send HTTP response: {}", e);
                         }
                         break;
                     }
+
+                    // Try to read a complete message using the length-prefix protocol
+                    // First, check if we have at least 4 bytes for the length prefix
+                    if n < 4 {
+                        println!("===== ERROR: Received too few bytes for length prefix: {} from {} =====", n, addr);
+                        error!("Received too few bytes for length prefix: {} from {}", n, addr);
+                        continue;
+                    }
+
+                    // Parse the message length from the first 4 bytes
+                    let message_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
                     
-                    // First check if this might be the client's first message with authentication
-                    // The client might not be adding magic bytes properly, try to handle auth specially
-                    if !authenticated && n > 0 {
-                        // Try to deserialize assuming it might be an auth message without magic bytes
-                        match bincode::deserialize::<NatMessage>(&buffer[..n]) {
-                            Ok(NatMessage::Authenticate { secret, client_id: id }) => {
-                                info!("Received potential direct auth message from {} for client ID {}", addr, id);
-                                
-                                // Even in a cloud environment, verify authentication
-                                if secret == self.auth_secret {
-                                    authenticated = true;
-                                    client_id = id.clone();
-                                    debug!("Client {} authenticated with ID {}", addr, client_id);
-                                    
-                                    // Register the client in our tracking system
-                                    if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
-                                        error!("Failed to register client {}: {}", client_id, e);
-                                        if let Err(e) = control_tx.send(NatMessage::Error { 
-                                            message: format!("Registration failed: {}", e) 
-                                        }).await {
-                                            error!("Failed to send registration error: {}", e);
+                    // Verify the length is reasonable to prevent attacks
+                    if message_len > READ_BUFFER_SIZE - 4 {
+                        println!("===== ERROR: Message too large: {} bytes from {} =====", message_len, addr);
+                        error!("Message too large: {} bytes from {}", message_len, addr);
+                        continue;
+                    }
+                    
+                    // Check if we have the complete message
+                    if n < 4 + message_len {
+                        println!("===== ERROR: Incomplete message: got {} bytes, expected {} bytes from {} =====", 
+                            n, 4 + message_len, addr);
+                        error!("Incomplete message: got {} bytes, expected {} bytes from {}", 
+                            n, 4 + message_len, addr);
+                        continue;
+                    }
+                    
+                    // Check for protocol magic bytes
+                    if message_len >= PROTOCOL_MAGIC.len() && 
+                       buffer[4..4 + PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC {
+                        
+                        println!("===== PROTOCOL: Valid TagIO message detected from {} =====", addr);
+                        debug!("Valid TagIO protocol magic bytes detected from {}", addr);
+                        
+                        // Extract the actual message data (after magic bytes)
+                        let message_data = &buffer[4 + PROTOCOL_MAGIC.len()..4 + message_len];
+                        
+                        // Try to deserialize the message
+                        match bincode::deserialize::<NatMessage>(message_data) {
+                            Ok(message) => {
+                                // Process the message based on its type
+                                match message {
+                                    NatMessage::Authenticate { secret, client_id: id } => {
+                                        println!("===== AUTH: Attempt from {} with ID {} =====", addr, id);
+                                        info!("Authentication attempt from {} with ID {}", addr, id);
+                                        
+                                        // Even in a cloud environment, verify authentication
+                                        if secret == self.auth_secret {
+                                            authenticated = true;
+                                            client_id = id.clone();
+                                            debug!("Client {} authenticated with ID {}", addr, client_id);
+                                            
+                                            // Register the client in our tracking system
+                                            if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
+                                                println!("===== ERROR: Failed to register client {} =====", client_id);
+                                                error!("Failed to register client {}: {}", client_id, e);
+                                                break;
+                                            }
+                                            
+                                            println!("===== CLIENT REGISTERED: {} at {} =====", client_id, public_addr);
+                                            
+                                            // Send authentication acknowledgment with public address info
+                                            println!("===== SENDING AUTH ACK to {} =====", client_id);
+                                            if let Err(e) = control_tx.send(NatMessage::AuthAck { 
+                                                public_addr,
+                                                message: format!("Authenticated as {} from {}", client_id, public_addr) 
+                                            }).await {
+                                                println!("===== ERROR: Failed to send auth ack to {} =====", client_id);
+                                                error!("Failed to send auth ack to {}: {}", client_id, e);
+                                                break;
+                                            }
+                                        } else {
+                                            // Track unauthorized attempts
+                                            let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                                            println!("===== AUTH FAIL: Invalid authentication from {} (attempt #{}) =====", addr, attempts);
+                                            if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
+                                                warn!("AUTH FAIL: Multiple unauthorized authentication attempts: {}", attempts);
+                                            } else {
+                                                warn!("AUTH FAIL: Invalid authentication from {}", addr);
+                                            }
+                                            
+                                            // Send error
+                                            println!("===== SENDING AUTH ERROR to {} =====", addr);
+                                            if let Err(e) = control_tx.send(NatMessage::AuthError { 
+                                                message: "Invalid authentication secret".to_string() 
+                                            }).await {
+                                                println!("===== ERROR: Failed to send auth error to {} =====", addr);
+                                                error!("Failed to send auth error: {}", e);
+                                            }
+                                            break;
                                         }
-                                        break;
+                                    },
+                                    
+                                    // Check version compatibility
+                                    NatMessage::VersionCheck { version } => {
+                                        if version != PROTOCOL_VERSION {
+                                            warn!("Protocol version mismatch from {}: got {}, expected {}", 
+                                                  addr, version, PROTOCOL_VERSION);
+                                            if let Err(e) = control_tx.send(NatMessage::Error { 
+                                                message: format!("Protocol version mismatch: server={}, client={}", 
+                                                                PROTOCOL_VERSION, version)
+                                            }).await {
+                                                error!("Failed to send version error message: {}", e);
+                                            }
+                                            break;
+                                        }
+                                        _version_checked = true;
+                                    },
+                                    
+                                    // STUN-like binding request for NAT detection
+                                    NatMessage::StunBindingRequest => {
+                                        if authenticated {
+                                            debug!("Received STUN binding request from client {}", client_id);
+                                            
+                                            // Send back the client's public address
+                                            if let Err(e) = control_tx.send(NatMessage::StunBindingResponse { 
+                                                public_addr 
+                                            }).await {
+                                                error!("Failed to send STUN binding response: {}", e);
+                                            } else {
+                                                debug!("Sent STUN binding response to {}: {}", client_id, public_addr);
+                                                
+                                                // Try to detect the client's NAT type if we have enough information
+                                                if !client_id.is_empty() {
+                                                    if let Err(e) = self.detect_nat_type(&client_id, public_addr, control_tx.clone()).await {
+                                                        debug!("NAT detection error for {}: {}", client_id, e);
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            warn!("Unauthenticated STUN binding request from {}", addr);
+                                            if let Err(e) = control_tx.send(NatMessage::Error { 
+                                                message: "Authentication required".to_string() 
+                                            }).await {
+                                                error!("Failed to send auth required error: {}", e);
+                                            }
+                                        }
+                                    },
+                                    
+                                    // Connect request
+                                    NatMessage::ConnectRequest { target_id } => {
+                                        if authenticated {
+                                            debug!("Connect request from {} to {}", client_id, target_id);
+                                            if let Err(e) = self.handle_connect_request(&client_id, &target_id, control_tx.clone()).await {
+                                                warn!("Failed to establish connection from {} to {}: {}", client_id, target_id, e);
+                                            }
+                                        } else {
+                                            warn!("Unauthenticated connect request from {}", addr);
+                                            if let Err(e) = control_tx.send(NatMessage::Error { 
+                                                message: "Authentication required".to_string() 
+                                            }).await {
+                                                error!("Failed to send auth required error: {}", e);
+                                            }
+                                            break;
+                                        }
+                                    },
+                                    
+                                    // Relay request
+                                    NatMessage::RelayRequest { target_id, session_id } => {
+                                        if authenticated {
+                                            debug!("Relay request from {} to {} with session {}", client_id, target_id, session_id);
+                                            if let Err(e) = self.handle_relay_request(&client_id, &target_id, &session_id, control_tx.clone()).await {
+                                                warn!("Failed to establish relay from {} to {}: {}", client_id, target_id, e);
+                                            }
+                                        } else {
+                                            warn!("Unauthenticated relay request from {}", addr);
+                                            if let Err(e) = control_tx.send(NatMessage::Error { 
+                                                message: "Authentication required".to_string() 
+                                            }).await {
+                                                error!("Failed to send auth required error: {}", e);
+                                            }
+                                            break;
+                                        }
+                                    },
+                                    
+                                    // Relay data
+                                    NatMessage::RelayData { session_id, data } => {
+                                        if authenticated {
+                                            if let Err(e) = self.handle_relay_data(&session_id, data).await {
+                                                debug!("Error relaying data for session {}: {}", session_id, e);
+                                            }
+                                        } else {
+                                            warn!("Unauthenticated relay data from {}", addr);
+                                            break;
+                                        }
+                                    },
+                                    
+                                    // Ping for keep-alive
+                                    NatMessage::Ping => {
+                                        // Send pong response
+                                        if let Err(e) = control_tx.send(NatMessage::Pong).await {
+                                            error!("Failed to send pong to {}: {}", addr, e);
+                                            break;
+                                        }
+                                    },
+                                    
+                                    // Ignore other messages - they are meant for clients
+                                    _ => {
+                                        debug!("Ignoring client-bound message from {}: {:?}", addr, message);
                                     }
-                                    
-                                    // Confirm authentication
-                                    if let Err(e) = control_tx.send(NatMessage::AuthAck { 
-                                        public_addr,
-                                        message: "Authentication successful".to_string()
-                                    }).await {
-                                        error!("Failed to send auth response: {}", e);
-                                        break;
-                                    }
-                                    
-                                    continue;
-                                } else {
-                                    // Authentication failed
-                                    warn!("AUTH FAIL: Invalid authentication from {}", addr);
-                                    self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst);
-                                    
-                                    if let Err(e) = control_tx.send(NatMessage::AuthError { 
-                                        message: "Invalid authentication token".to_string()
-                                    }).await {
-                                        error!("Failed to send auth failure response: {}", e);
-                                    }
-                                    
-                                    break;
                                 }
                             },
-                            _ => {
-                                // Not a valid auth message, continue with normal protocol check
+                            Err(e) => {
+                                println!("===== ERROR: Failed to deserialize message from {} =====", addr);
+                                error!("Failed to deserialize message from {}: {}", addr, e);
+                                // Don't break here - could be a corrupted message
                             }
                         }
-                    }
-                    
-                    // Verify magic bytes for the TagIO protocol
-                    if n < PROTOCOL_MAGIC.len() || &buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
-                        // This is normal for health check systems - log at debug level for automated checks
-                        if addr.ip().is_loopback() {
-                            info!("PROTOCOL MISMATCH: Connection from localhost ({}) with non-TagIO protocol", addr);
-                        } else {
-                            // For non-localhost, still warn as it could be an actual issue
-                            warn!("PROTOCOL MISMATCH: Invalid protocol magic bytes from {}", addr);
-                        }
+                    } else {
+                        // Invalid protocol magic bytes - this could be a client that doesn't use the TagIO protocol
+                        println!("===== PROTOCOL ERROR: Missing or invalid magic bytes from {} =====", addr);
+                        warn!("Missing or invalid protocol magic bytes from {}", addr);
                         
-                        // Try to send a response anyway if it looks like a valid connection
-                        if n > 0 {
-                            let response = "HTTP/1.1 400 Bad Request\r\n\
-                                           Content-Type: text/plain\r\n\
-                                           Content-Length: 59\r\n\
-                                           \r\n\
-                                           Invalid protocol: TagIO Relay Server requires TagIO protocol";
-                            
-                            if let Err(e) = http_tx.send(response.to_string()).await {
-                                debug!("Failed to send protocol error response: {}", e);
-                            }
-                        }
-                        break;
-                    }
-                    
-                    // Successfully received TagIO protocol data
-                    if !authenticated {
-                        info!("PROTOCOL DETECTED: Valid TagIO client from {}, processing message", addr);
-                    }
-                    
-                    // Deserialize the message (skip the magic bytes)
-                    match bincode::deserialize::<NatMessage>(&buffer[PROTOCOL_MAGIC.len()..n]) {
-                        Ok(message) => {
-                            trace!("Received message from {}: {:?}", addr, message);
-                            
-                            // Process message based on type
-                            match message {
-                                // Check version compatibility
-                                NatMessage::VersionCheck { version } => {
-                                    if version != PROTOCOL_VERSION {
-                                        warn!("Protocol version mismatch from {}: got {}, expected {}", 
-                                              addr, version, PROTOCOL_VERSION);
-                                        if let Err(e) = control_tx.send(NatMessage::Error { 
-                                            message: format!("Protocol version mismatch: server={}, client={}", 
-                                                            PROTOCOL_VERSION, version)
-                                        }).await {
-                                            error!("Failed to send version error message: {}", e);
-                                        }
-                                        break;
-                                    }
-                                    _version_checked = true;
-                                },
-                                
-                                // STUN-like binding request for NAT detection
-                                NatMessage::StunBindingRequest => {
-                                    if authenticated {
-                                        debug!("Received STUN binding request from client {}", client_id);
+                        // Try to guess if the client is attempting an older protocol version
+                        // This helps with backwards compatibility for older clients
+                        if n > PROTOCOL_MAGIC.len() {
+                            match bincode::deserialize::<NatMessage>(&buffer[..n]) {
+                                Ok(NatMessage::Authenticate { secret, client_id: id }) => {
+                                    println!("===== LEGACY PROTOCOL: Detected authentication attempt without magic bytes from {} =====", addr);
+                                    info!("Detected legacy protocol with authentication from {} for ID {}", addr, id);
+                                    
+                                    // Handle legacy client authentication
+                                    if secret == self.auth_secret {
+                                        authenticated = true;
+                                        client_id = id.clone();
                                         
-                                        // Send back the client's public address
-                                        if let Err(e) = control_tx.send(NatMessage::StunBindingResponse { 
-                                            public_addr 
-                                        }).await {
-                                            error!("Failed to send STUN binding response: {}", e);
-                                        } else {
-                                            debug!("Sent STUN binding response to {}: {}", client_id, public_addr);
+                                        println!("===== AUTH SUCCESS (LEGACY): Client {} authenticated from {} =====", id, addr);
+                                        info!("Legacy client {} successfully authenticated from {}", id, addr);
+                                        
+                                        // Register the client
+                                        if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
+                                            println!("===== ERROR: Failed to register legacy client {} =====", id);
+                                            error!("Failed to register legacy client {}: {}", id, e);
+                                            break;
+                                        }
+                                        
+                                        // Send auth ack in legacy format (without length prefix or magic bytes)
+                                        let response = NatMessage::AuthAck {
+                                            public_addr,
+                                            message: format!("Authenticated as {} from {}", id, public_addr)
+                                        };
+                                        
+                                        if let Ok(data) = bincode::serialize(&response) {
+                                            // Send without length prefix for legacy clients
+                                            write_task.abort();
                                             
-                                            // Try to detect the client's NAT type if we have enough information
-                                            if !client_id.is_empty() {
-                                                if let Err(e) = self.detect_nat_type(&client_id, public_addr, control_tx.clone()).await {
-                                                    debug!("NAT detection error for {}: {}", client_id, e);
-                                                }
+                                            // Write directly to the socket
+                                            if let Err(e) = http_tx.send(String::from_utf8_lossy(&data).to_string()).await {
+                                                error!("Failed to send legacy auth response: {}", e);
                                             }
                                         }
                                     } else {
-                                        warn!("Unauthenticated STUN binding request from {}", addr);
-                                        if let Err(e) = control_tx.send(NatMessage::Error { 
-                                            message: "Authentication required".to_string() 
-                                        }).await {
-                                            error!("Failed to send auth required error: {}", e);
-                                        }
-                                    }
-                                },
-                                
-                                // Authentication message - improve logging
-                                NatMessage::Authenticate { secret, client_id: id } => {
-                                    // Even in a cloud environment, verify authentication
-                                    if secret == self.auth_secret {
-                                        authenticated = true;
-                                        client_id = id;
+                                        // Send auth error for legacy client
+                                        println!("===== AUTH FAIL (LEGACY): Invalid authentication from {} =====", addr);
+                                        warn!("Legacy client from {} failed authentication", addr);
                                         
-                                        info!("AUTH SUCCESS: Client {} authenticated from {}", client_id, addr);
+                                        let auth_error = NatMessage::AuthError {
+                                            message: "Invalid authentication secret".to_string()
+                                        };
                                         
-                                        // Register the client with its public address
-                                        if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
-                                            error!("Failed to register client {}: {}", client_id, e);
-                                            break;
+                                        if let Ok(data) = bincode::serialize(&auth_error) {
+                                            if let Err(e) = http_tx.send(String::from_utf8_lossy(&data).to_string()).await {
+                                                error!("Failed to send legacy auth error: {}", e);
+                                            }
                                         }
-                                        
-                                        // Send authentication acknowledgment with public address info
-                                        if let Err(e) = control_tx.send(NatMessage::AuthAck { 
-                                            public_addr,
-                                            message: format!("Authenticated as {} from {}", client_id, public_addr) 
-                                        }).await {
-                                            error!("Failed to send auth ack to {}: {}", client_id, e);
-                                            break;
-                                        }
-                                    } else {
-                                        // Track unauthorized attempts
-                                        let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                                        if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
-                                            warn!("AUTH FAIL: Multiple unauthorized authentication attempts: {}", attempts);
-                                        } else {
-                                            warn!("AUTH FAIL: Invalid authentication from {}", addr);
-                                        }
-                                        
-                                        // Send error
-                                        if let Err(e) = control_tx.send(NatMessage::AuthError { 
-                                            message: "Invalid authentication secret".to_string() 
-                                        }).await {
-                                            error!("Failed to send auth error: {}", e);
-                                        }
-                                        break;
                                     }
+                                    continue;
                                 },
-                                
-                                // Connect request
-                                NatMessage::ConnectRequest { target_id } => {
-                                    if authenticated {
-                                        debug!("Connect request from {} to {}", client_id, target_id);
-                                        if let Err(e) = self.handle_connect_request(&client_id, &target_id, control_tx.clone()).await {
-                                            warn!("Failed to establish connection from {} to {}: {}", client_id, target_id, e);
-                                        }
-                                    } else {
-                                        warn!("Unauthenticated connect request from {}", addr);
-                                        if let Err(e) = control_tx.send(NatMessage::Error { 
-                                            message: "Authentication required".to_string() 
-                                        }).await {
-                                            error!("Failed to send auth required error: {}", e);
-                                        }
-                                        break;
-                                    }
-                                },
-                                
-                                // Relay request
-                                NatMessage::RelayRequest { target_id, session_id } => {
-                                    if authenticated {
-                                        debug!("Relay request from {} to {} with session {}", client_id, target_id, session_id);
-                                        if let Err(e) = self.handle_relay_request(&client_id, &target_id, &session_id, control_tx.clone()).await {
-                                            warn!("Failed to establish relay from {} to {}: {}", client_id, target_id, e);
-                                        }
-                                    } else {
-                                        warn!("Unauthenticated relay request from {}", addr);
-                                        if let Err(e) = control_tx.send(NatMessage::Error { 
-                                            message: "Authentication required".to_string() 
-                                        }).await {
-                                            error!("Failed to send auth required error: {}", e);
-                                        }
-                                        break;
-                                    }
-                                },
-                                
-                                // Relay data
-                                NatMessage::RelayData { session_id, data } => {
-                                    if authenticated {
-                                        if let Err(e) = self.handle_relay_data(&session_id, data).await {
-                                            debug!("Error relaying data for session {}: {}", session_id, e);
-                                        }
-                                    } else {
-                                        warn!("Unauthenticated relay data from {}", addr);
-                                        break;
-                                    }
-                                },
-                                
-                                // Ping for keep-alive
-                                NatMessage::Ping => {
-                                    // Send pong response
-                                    if let Err(e) = control_tx.send(NatMessage::Pong).await {
-                                        error!("Failed to send pong to {}: {}", addr, e);
-                                        break;
-                                    }
-                                },
-                                
-                                // Ignore other messages - they are meant for clients
                                 _ => {
-                                    debug!("Ignoring client-bound message from {}: {:?}", addr, message);
+                                    // Not a legacy auth message - likely just wrong protocol
+                                    // Send an HTTP-like error response so client gets feedback
+                                    let error_body = "Invalid protocol: TagIO Relay Server requires TagIO protocol with length prefix and magic bytes";
+                                    let response = format!("HTTP/1.1 400 Bad Request\r\n\
+                                                   Content-Type: text/plain\r\n\
+                                                   Content-Length: {}\r\n\
+                                                   Connection: close\r\n\
+                                                   \r\n\
+                                                   {}", error_body.len(), error_body);
+                                    
+                                    if let Err(e) = http_tx.send(response).await {
+                                        error!("Failed to send protocol error response: {}", e);
+                                    }
+                                    break;
                                 }
                             }
-                        },
-                        Err(e) => {
-                            error!("Failed to deserialize message from {}: {}", addr, e);
-                            // Don't break here - could be a corrupted message
+                        } else {
+                            // Too short to even try to parse - send error and disconnect
+                            let error_body = "Invalid protocol: TagIO Relay Server requires TagIO protocol with length prefix and magic bytes";
+                            let response = format!("HTTP/1.1 400 Bad Request\r\n\
+                                                   Content-Type: text/plain\r\n\
+                                                   Content-Length: {}\r\n\
+                                                   Connection: close\r\n\
+                                                   \r\n\
+                                                   {}", error_body.len(), error_body);
+                            
+                            if let Err(e) = http_tx.send(response).await {
+                                error!("Failed to send protocol error response: {}", e);
+                            }
+                            break;
                         }
                     }
                 },
@@ -905,6 +992,7 @@ impl RelayServer {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     // Enhance logging with more descriptive information
+                    println!("===== NEW CONNECTION: Client connected from {} =====", addr);
                     info!("NEW CONNECTION: Client connected from {}", addr);
                     
                     // Clone necessary state for the client handler

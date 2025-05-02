@@ -115,33 +115,36 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args = CliArgs::parse();
     
-    // Configure logging
-    if args.verbose {
-        env::set_var("RUST_LOG", "info");
+    // Print banner immediately to console
+    println!("===== STARTING TAGIO RELAY SERVER v{} =====", env!("CARGO_PKG_VERSION"));
+    
+    // Check if running in Render cloud environment
+    let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
+    
+    // Configure logging - ensure it's verbose in cloud environments
+    if args.verbose || is_render {
+        // Use verbose logging in Render environment
+        if is_render {
+            println!("RENDER ENV: Setting TRACE log level");
+            env::set_var("RUST_LOG", "trace");
+        } else {
+            env::set_var("RUST_LOG", "info");
+        }
     } else {
         env::set_var("RUST_LOG", "warn");
     }
     
-    // Initialize custom logger with [ T ] prefix for easy identification in Render's logs
+    // Initialize custom logger with simple prefix
     env_logger::builder()
         .format(|buf, record| {
-            let timestamp = buf.timestamp();
-            let level = record.level();
-            let target = record.target();
-            writeln!(
-                buf,
-                "[ T ] {} {} {} - {}",
-                timestamp,
-                level,
-                target,
-                record.args()
-            )
+            writeln!(buf, "[ T ] {} | {}", record.level(), record.args())
         })
         .init();
     
+    println!("LOGGER: Initialized");
     info!("Starting TagIO relay server initialization...");
     
-    // Initialize variables with default values for cloud deployment
+    // Initialize variables with default values
     let mut bind_addr = DEFAULT_BIND_ADDRESS.to_string();
     let mut public_ip = None;
     let mut auth_secret = None;
@@ -152,7 +155,25 @@ async fn main() -> Result<()> {
     // If running in cloud environment or force_cloud_ip flag is set, use the known public IP
     if args.force_cloud_ip || is_cloud {
         info!("Cloud environment detected or cloud IP forced - using known cloud server IP");
+        println!("CLOUD MODE: Using cloud server IP {}", CLOUD_SERVER_IP);
         public_ip = Some(CLOUD_SERVER_IP.to_string());
+    }
+    
+    // Try to get the PORT environment variable for cloud environments
+    let cloud_port = env::var("PORT").ok().and_then(|port_str| port_str.parse::<u16>().ok());
+    
+    // Define preferred ports for binding in order of preference
+    // Non-privileged ports first, then fallback to privileged ones if running with sufficient permissions
+    let preferred_ports = [10000, 8080, 3000, 443, 80];
+    
+    // In a cloud environment, prioritize the PORT environment variable if available
+    if is_cloud && cloud_port.is_some() {
+        let port = cloud_port.unwrap();
+        println!("CLOUD PORT: Using environment PORT={}", port);
+        bind_addr = format!("0.0.0.0:{}", port);
+    } else if let Some(ref b) = args.bind {
+        // Command-line bind address overrides defaults
+        bind_addr = b.clone();
     }
     
     // If interactive mode is enabled, prompt for configuration
@@ -214,8 +235,8 @@ async fn main() -> Result<()> {
         }
     } else {
         // Use command line arguments
-        if let Some(b) = args.bind {
-            bind_addr = b;
+        if let Some(ref b) = args.bind {
+            bind_addr = b.clone();
         }
         
         // If not using cloud IP mode, check command line provided IP
@@ -234,27 +255,40 @@ async fn main() -> Result<()> {
     
     // Run the server - use logger instead of println!
     info!("Starting TagIO relay server...");
+    println!("===== TagIO Cloud Relay Server v{} =====", env!("CARGO_PKG_VERSION"));
     info!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
     info!("Protocol Version: {}", PROTOCOL_VERSION);
+    println!("Protocol Version: {}", PROTOCOL_VERSION);
     info!("Bind Address: {}", bind_addr);
+    println!("Bind Address: {}", bind_addr);
     if let Some(ip) = &public_ip {
         info!("Public IP: {} (explicitly configured)", ip);
+        println!("Public IP: {} (explicitly configured)", ip);
     } else {
         info!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
+        println!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
     }
     if auth_secret.is_some() {
         info!("Authentication: Enabled with custom secret");
+        println!("Authentication: Enabled with custom secret");
     } else {
         info!("Authentication: Enabled with default secret");
+        println!("Authentication: Enabled with default secret");
     }
     if args.relay_only {
         info!("NAT Traversal: DISABLED (relay mode only)");
+        println!("NAT Traversal: DISABLED (relay mode only)");
     } else {
         info!("NAT Traversal: ENABLED");
+        println!("NAT Traversal: ENABLED");
     }
+    println!("==========================================");
     info!("==========================================");
+    println!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
     info!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
+    println!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
     info!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
+    println!("==========================================");
     info!("==========================================");
     
     // Create server with cloned values
