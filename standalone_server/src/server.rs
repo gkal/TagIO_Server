@@ -4,16 +4,18 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, IpAddr},
     sync::Arc,
     collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
-    net::IpAddr,
 };
 use log::{debug, error, info, warn, trace};
-use crate::messages::{NatMessage, NatTraversalType, NatType};
-use crate::constants::{DEFAULT_AUTH_SECRET, PROTOCOL_MAGIC, MAX_PORT_PREDICTION_RANGE, KEEP_ALIVE_INTERVAL_SECS, NAT_TRAVERSAL_TIMEOUT_SECS};
-use crate::messages::PROTOCOL_VERSION;
+use crate::messages::{NatMessage, NatTraversalType, NatType, PROTOCOL_VERSION};
+use crate::constants::{
+    DEFAULT_AUTH_SECRET,
+    PROTOCOL_MAGIC,
+    MAX_PORT_PREDICTION_RANGE
+};
 
 // Keep alive timeout
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,7 +97,7 @@ impl RelayServer {
                 for port in PREFERRED_PORTS.iter() {
                     let alt_addr = format!("{}:{}", base_ip, port);
                     match TcpListener::bind(&alt_addr).await {
-                        Ok(listener) => {
+                        Ok(_listener) => {
                             info!("Successfully bound to alternative address: {}", alt_addr);
                             bound_port = *port;
                             success = true;
@@ -316,7 +318,7 @@ impl RelayServer {
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut client_id = String::new();
         let mut authenticated = false;
-        let mut version_checked = false;
+        let mut _version_checked = false;
         
         // Process messages from the client
         loop {
@@ -364,7 +366,7 @@ impl RelayServer {
                                         }
                                         break;
                                     }
-                                    version_checked = true;
+                                    _version_checked = true;
                                 },
                                 
                                 // STUN-like binding request for NAT detection
@@ -736,7 +738,7 @@ impl RelayServer {
         
         // Get the client's registered data
         let clients = self.clients.lock().await;
-        let client_info = match clients.get(client_id) {
+        let _client_info = match clients.get(client_id) {
             Some(info) => info,
             None => return Err(anyhow!("Client not found")),
         };

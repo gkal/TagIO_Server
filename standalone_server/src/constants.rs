@@ -20,6 +20,8 @@ pub const DEFAULT_AUTH_SECRET: &str = "tagio_default_secret";
 pub const PROTOCOL_MAGIC: [u8; 5] = [0x54, 0x41, 0x47, 0x49, 0x4F];
 
 // NAT traversal constants
-pub const KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
-pub const NAT_TRAVERSAL_TIMEOUT_SECS: u64 = 10;
+pub const _HTTP_PORT_PRIORITIES: [u16; 5] = [10000, 8080, 3000, 443, 80];
+pub const _PORT_PREDICTION_RANGE: usize = 10;
+pub const _KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+pub const _NAT_TRAVERSAL_TIMEOUT_SECS: u64 = 10;
 pub const MAX_PORT_PREDICTION_RANGE: u16 = 10; 
