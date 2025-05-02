@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 // Define default relay server with standard HTTPS port for better firewall traversal
-pub const DEFAULT_RELAY_SERVER: &str = "relay.tagio.io:443";
+pub const DEFAULT_RELAY_SERVER: &str = "tagio.onrender.com:443";
 
 // Define the default authentication secret (duplicate from relay to avoid circular dependencies)
 pub const DEFAULT_AUTH_SECRET: &str = "tagio_default_secret";

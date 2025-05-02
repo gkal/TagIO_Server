@@ -72,9 +72,14 @@ impl NatTraversalClient {
     pub async fn connect_to_relay(&mut self) -> Result<()> {
         debug!("Connecting to relay server at {}", self.relay_server);
         
-        // Try to connect to relay server
-        match TcpStream::connect(&self.relay_server).await {
-            Ok(stream) => {
+        // Try to connect to relay server with a timeout
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(&self.relay_server)
+        ).await;
+        
+        match connect_result {
+            Ok(Ok(stream)) => {
                 self.control_stream = Some(stream);
                 debug!("Connected to relay server via TCP");
                 
@@ -90,58 +95,46 @@ impl NatTraversalClient {
                 self.send_message(&auth_msg).await?;
                 debug!("Sent authentication request to relay server");
                 
-                // Wait for auth response
-                match self.receive_message().await? {
-                    Some(NatMessage::AuthSuccess { client_id }) => {
+                // Wait for auth response with timeout
+                let auth_response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.receive_message()
+                ).await;
+                
+                match auth_response {
+                    Ok(Ok(Some(NatMessage::AuthSuccess { client_id }))) => {
                         info!("Successfully authenticated with relay server as {}", client_id);
-                    },
-                    Some(NatMessage::AuthFailure { reason }) => {
-                        error!("Authentication with relay server failed: {}", reason);
-                        return Err(anyhow!("Authentication failed: {}", reason));
-                    },
-                    Some(other) => {
-                        error!("Unexpected response to authentication: {:?}", other);
-                        return Err(anyhow!("Unexpected authentication response"));
-                    },
-                    None => {
-                        error!("No response to authentication request");
-                        return Err(anyhow!("No authentication response"));
-                    }
-                }
-                
-                // Send registration message
-                let register_msg = NatMessage::Register {
-                    client_id: self.client_id.clone(),
-                };
-                
-                self.send_message(&register_msg).await?;
-                debug!("Sent registration request to relay server");
-                
-                // Wait for acknowledgment
-                match self.receive_message().await? {
-                    Some(NatMessage::RegisterAck { public_addr }) => {
-                        // Store our public address as reported by the relay server
-                        self.public_addr = Some(public_addr);
-                        info!("Successfully registered with relay server. Public address: {}", public_addr);
-                        
-                        // Start the keepalive task
-                        self.start_tcp_keepalive_task();
-                        
                         Ok(())
                     },
-                    Some(other) => {
-                        error!("Unexpected response to registration: {:?}", other);
-                        Err(anyhow!("Unexpected registration response"))
+                    Ok(Ok(Some(NatMessage::AuthFailure { reason }))) => {
+                        error!("Authentication with relay server failed: {}", reason);
+                        Err(anyhow!("Authentication failed: {}", reason))
                     },
-                    None => {
-                        error!("No response to registration request");
-                        Err(anyhow!("No registration response"))
+                    Ok(Ok(Some(other))) => {
+                        error!("Unexpected response to authentication: {:?}", other);
+                        Err(anyhow!("Unexpected authentication response"))
+                    },
+                    Ok(Ok(None)) => {
+                        error!("No response to authentication request");
+                        Err(anyhow!("No authentication response"))
+                    },
+                    Ok(Err(e)) => {
+                        error!("Error receiving authentication response: {}", e);
+                        Err(anyhow!("Error receiving authentication response: {}", e))
+                    },
+                    Err(_) => {
+                        error!("Authentication response timed out");
+                        Err(anyhow!("Authentication response timed out"))
                     }
                 }
             },
-            Err(e) => {
-                error!("Failed to connect to relay server at {}: {}", self.relay_server, e);
+            Ok(Err(e)) => {
+                error!("Failed to connect to relay server: {}", e);
                 Err(anyhow!("Failed to connect to relay server: {}", e))
+            },
+            Err(_) => {
+                error!("Connection to relay server timed out");
+                Err(anyhow!("Connection to relay server timed out"))
             }
         }
     }

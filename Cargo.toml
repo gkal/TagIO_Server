@@ -12,69 +12,56 @@ version = "0.1.9"
 edition = "2021"
 authors = ["TagIO Team"]
 description = "A secure remote desktop application"
+default-run = "tagio-gui"
+autobins = false
 
 [dependencies]
-# Optimize tokio to only include features we need instead of "full"
+# Core async runtime
 tokio = { version = "1.33.0", features = [
-    "rt-multi-thread", "macros", "sync", "time", "io-util",
-    "net", "fs", "io-std"
+    "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"
 ]}
 anyhow = "1.0.75"
+# Windows-specific features for the UI only
 windows = { version = "0.52.0", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse", 
     "Win32_Foundation",
-    "Win32_Graphics_Gdi",
-    "Win32_UI_Controls",
-    "Win32_UI_Controls_Dialogs",
-    "Win32_System_LibraryLoader"
+    "Win32_Graphics_Gdi"
 ]}
-# Optimize image to include only required formats
+# Image compression with minimal features
 image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1.0.193", features = ["derive"] }
 bincode = "1.3.3"
 aes-gcm = "0.10.3"
 rand = "0.8.5"
 ctrlc = "3.4.1"
-rfd = "0.12.0"  # File dialogs and message boxes
-# Choose one GUI framework - we're using eframe
+# File dialogs
+rfd = "0.12.0"
+# GUI framework - minimal features
 egui = "0.26.0"
 eframe = { version = "0.26.0", default-features = false, features = ["default_fonts", "glow"] }
-winit = "0.29.15"
 serde_json = "1.0.108"
 dirs = "5.0.1"
-# Native Windows GUI can be removed if you're using eframe exclusively
-# native-windows-gui = "1.0.13"
-# native-windows-derive = "1.0.5"
+# NAT traversal - necessary for peer connections
 igd = "0.12.1"
 stun-client = "0.1.4"
 local-ip-address = "0.5.6"
 uuid = { version = "1.3.0", features = ["v4"] }
-# TLS support dependencies
+# TLS support - critical for security
 rustls = { version = "0.21.7", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0.3"
 tokio-rustls = "0.24.1"
 rcgen = "0.11.3"
 webpki-roots = "0.25.2"
-# Required by cert_utils.rs for certificate validation
+# Time handling with minimal features
 time = { version = "0.3.30", features = ["formatting"] }
-# Enhanced logging
+# Logging with minimal overhead
 log = "0.4.20"
 env_logger = "0.10.0"
-# Only used for timestamp formatting in logs
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 once_cell = "1.18.0"
 socket2 = "0.5.9"
-# Add this with other dependencies
 async-trait = "0.1.74"
-# For public IP lookup in relay server
-# reqwest = { version = "0.11", features = ["blocking"] }
-inputbot = "0.5.1"
-
-# Removing unused dependencies:
-# - webrtc (not used in the codebase)
-
-# Only keep the necessary binaries
 
 # Client GUI
 [[bin]]

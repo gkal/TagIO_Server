@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use local_ip_address::local_ip;
 use anyhow::{Result, anyhow};
+use env_logger;
 
 // Information about each connected client
 struct ClientInfo {
@@ -36,7 +36,11 @@ impl RelayServer {
     
     // Start the relay server
     async fn run(&self, bind_addr: &str) -> io::Result<()> {
-        // Bind to the specified address
+        // Start the health check endpoint on port 8080
+        let health_check_addr = "0.0.0.0:8080";
+        let health_check_server = Self::run_health_check(health_check_addr);
+        
+        // Bind to the specified address for the main server
         let listener = TcpListener::bind(bind_addr).await?;
         println!("TagIO relay server listening on {}", bind_addr);
         
@@ -54,6 +58,9 @@ impl RelayServer {
         } else {
             println!("Authentication disabled - all connections will be accepted");
         }
+        
+        // Spawn health check task
+        tokio::spawn(health_check_server);
         
         // Accept and handle connections
         loop {
@@ -422,6 +429,28 @@ impl RelayServer {
         
         Ok(())
     }
+
+    // Add a new static method to run the health check endpoint
+    async fn run_health_check(addr: &str) {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                println!("Health check endpoint listening on {}", addr);
+                
+                loop {
+                    if let Ok((mut socket, _)) = listener.accept().await {
+                        tokio::spawn(async move {
+                            // Simple HTTP response
+                            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                            let _ = socket.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to start health check endpoint: {}", e);
+            }
+        }
+    }
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -434,157 +463,85 @@ fn prompt_input(prompt: &str) -> String {
     input.trim().to_string()
 }
 
-fn detect_local_ip() -> Result<String> {
-    match local_ip() {
-        Ok(ip) => Ok(ip.to_string()),
-        Err(e) => Err(anyhow!("Failed to detect local IP: {}", e))
+// Helper function to detect public IP
+async fn detect_public_ip() -> Result<String> {
+    // Use a simple HTTP service to detect public IP
+    println!("Detecting public IP address...");
+    
+    // We can't use curl directly in Rust, so let's return a manual message
+    println!("Automatic IP detection not available in this build.");
+    println!("Please manually set the PUBLIC_IP environment variable on Render.");
+    
+    Err(anyhow!("Automatic IP detection not implemented"))
+}
+
+fn prompt_yes_no(prompt: &str) -> bool {
+    print!("{} ", prompt);
+    io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
     }
+    
+    let input = input.trim().to_lowercase();
+    input == "y" || input == "yes"
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("TagIO Relay Server");
-    println!("-----------------");
-    
-    // Parse command line arguments
+    // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
-    let mut bind_addr = "0.0.0.0:443".to_string();
-    let mut public_ip = None;
-    let mut auth_secret = None;
     
-    // Simple command line argument parsing
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--bind" | "-b" => {
-                if i + 1 < args.len() {
-                    bind_addr = args[i + 1].clone();
-                    i += 2;
-                } else {
-                    eprintln!("Missing argument for --bind");
-                    return Ok(());
+    // Initialize logging
+    env_logger::init();
+    
+    // Get binding address from environment variable or use default
+    let bind_addr = env::var("PORT")
+        .map(|port| format!("0.0.0.0:{}", port))
+        .unwrap_or_else(|_| "0.0.0.0:443".to_string());
+    
+    println!("TagIO Relay Server v{}", env!("CARGO_PKG_VERSION"));
+    println!("Starting relay server on {}", bind_addr);
+    
+    // Get public IP from environment variable or prompt
+    let public_ip = env::var("PUBLIC_IP").ok();
+    let public_ip = if public_ip.is_none() && !args.contains(&"--auto-detect".to_string()) {
+        let auto_detect = prompt_yes_no("Do you want to auto-detect your public IP? (y/n)");
+        if auto_detect {
+            match detect_public_ip().await {
+                Ok(ip) => {
+                    println!("Auto-detected public IP: {}", ip);
+                    Some(ip)
                 }
-            },
-            "--public-ip" | "-p" => {
-                if i + 1 < args.len() {
-                    public_ip = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Missing argument for --public-ip");
-                    return Ok(());
+                Err(e) => {
+                    eprintln!("Failed to auto-detect public IP: {}", e);
+                    let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
+                    if manual_ip.is_empty() { None } else { Some(manual_ip) }
                 }
-            },
-            "--auth" | "-a" => {
-                if i + 1 < args.len() {
-                    auth_secret = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Missing argument for --auth");
-                    return Ok(());
-                }
-            },
-            "--help" | "-h" => {
-                println!("TagIO Relay Server");
-                println!("Usage: tagio_relay_server [options]");
-                println!("Options:");
-                println!("  --bind, -b <address>       Bind address (default: 0.0.0.0:443)");
-                println!("  --public-ip, -p <ip>       Public IP address for NAT traversal");
-                println!("  --auth, -a <secret>        Set authentication secret for clients");
-                println!("  --help, -h                 Show this help message");
-                return Ok(());
-            },
-            _ => {
-                i += 1;
             }
-        }
-    }
-    
-    // Attempt to detect the local IP address
-    let local_ip = match detect_local_ip() {
-        Ok(ip) => ip,
-        Err(_) => "Unknown".to_string(),
-    };
-    
-    println!("Server Configuration");
-    println!("-------------------");
-    println!("Detected local IP: {}", local_ip);
-    println!("NOTE: This is your internal network IP, not your public IP.");
-    
-    // If public IP not provided via command line, prompt for it
-    let public_ip = if public_ip.is_none() {
-        println!("\nImportant: A public IP is needed for proper NAT traversal.");
-        println!("You can determine your public IP by visiting a site like whatismyip.com");
-        
-        let ip = prompt_input("Enter your public IP address (or leave empty to auto-detect): ");
-        if ip.is_empty() {
-            println!("No public IP provided. NAT traversal may not work correctly!");
-            None
         } else {
-            println!("Using public IP: {}", ip);
-            Some(ip)
+            let manual_ip = prompt_input("Please enter your server's public IP address (leave empty to use socket addresses):");
+            if manual_ip.is_empty() { None } else { Some(manual_ip) }
         }
     } else {
-        println!("\nUsing configured public IP: {:?}", public_ip);
         public_ip
     };
     
-    // Get port from bind_addr or prompt for it
-    let bind_parts: Vec<&str> = bind_addr.split(':').collect();
-    let host = bind_parts[0];
-    let port = if bind_parts.len() > 1 {
-        bind_parts[1].to_string()
+    if let Some(ip) = &public_ip {
+        println!("Using public IP address: {}", ip);
     } else {
-        prompt_input("Enter port to listen on (default: 443): ")
-    };
-    
-    let port = if port.is_empty() { "443".to_string() } else { port };
-    let bind_addr = format!("{}:{}", host, port);
-    
-    // Authentication setup
-    let auth_secret = if auth_secret.is_none() {
-        let use_auth = prompt_input("Enable authentication? (y/n, default: n): ").to_lowercase();
-        if use_auth == "y" || use_auth == "yes" {
-            let secret = prompt_input("Enter authentication secret: ");
-            if secret.is_empty() {
-                println!("No authentication secret provided. Authentication disabled.");
-                None
-            } else {
-                println!("Authentication enabled with provided secret.");
-                Some(secret)
-            }
-        } else {
-            println!("Authentication disabled.");
-            None
-        }
-    } else {
-        println!("Using configured authentication secret.");
-        auth_secret
-    };
-    
-    println!("\nRelay Server Settings");
-    println!("--------------------");
-    println!("Bind Address: {}", bind_addr);
-    if let Some(ref ip) = public_ip {
-        println!("Public IP: {}", ip);
-    } else {
-        println!("Public IP: Auto-detect (not recommended)");
+        println!("No public IP specified, using client-perceived addresses");
     }
     
-    if auth_secret.is_some() {
-        println!("Authentication: Enabled");
-    } else {
-        println!("Authentication: Disabled");
-    }
+    // Get auth secret from environment variable or use default
+    let auth_secret = env::var("AUTH_SECRET").ok();
     
-    // Create and run the relay server
+    // Run the relay server
     let server = RelayServer::new(public_ip, auth_secret);
-    match server.run(&bind_addr).await {
-        Ok(_) => println!("Server stopped"),
-        Err(e) => {
-            eprintln!("Error running server: {}", e);
-            eprintln!("Note: If binding to port 443 fails, try using a different port");
-            eprintln!("      or run with elevated privileges (e.g., as administrator)");
-        }
+    if let Err(e) = server.run(&bind_addr).await {
+        eprintln!("Error running server: {}", e);
+        return Err(anyhow!("Server error: {}", e));
     }
     
     Ok(())

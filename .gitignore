@@ -32,3 +32,6 @@ TagIO/target/
 
 # Generated documentation
 /doc/
+
+# Render deployment files
+.render/

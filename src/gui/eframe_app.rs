@@ -52,7 +52,7 @@ impl Default for TagIOApp {
         
         // Set default relay server if empty
         if relay_server.is_empty() {
-            relay_server = "relay.tagio.io:443".to_string();
+            relay_server = "tagio.onrender.com:443".to_string();
             if let Some(cfg) = &mut config {
                 cfg.relay_server = relay_server.clone();
                 let _ = config::save_config(cfg);
