@@ -1,6 +1,6 @@
 [package]
 name = "tagio_relay_server"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 authors = ["TagIO Team"]
 description = "TagIO Relay Server - Standalone NAT traversal server for TagIO"

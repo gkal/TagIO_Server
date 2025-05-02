@@ -232,27 +232,30 @@ async fn main() -> Result<()> {
         public_ip = Some(CLOUD_SERVER_IP.to_string());
     }
     
-    // Run the server
+    // Run the server - use logger instead of println!
     info!("Starting TagIO relay server...");
-    println!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
-    println!("Protocol Version: {}", PROTOCOL_VERSION);
-    println!("Bind Address: {}", bind_addr);
+    info!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
+    info!("Protocol Version: {}", PROTOCOL_VERSION);
+    info!("Bind Address: {}", bind_addr);
     if let Some(ip) = &public_ip {
-        println!("Public IP: {} (explicitly configured)", ip);
+        info!("Public IP: {} (explicitly configured)", ip);
     } else {
-        println!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
+        info!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
     }
     if auth_secret.is_some() {
-        println!("Authentication: Enabled with custom secret");
+        info!("Authentication: Enabled with custom secret");
     } else {
-        println!("Authentication: Enabled with default secret");
+        info!("Authentication: Enabled with default secret");
     }
     if args.relay_only {
-        println!("NAT Traversal: DISABLED (relay mode only)");
+        info!("NAT Traversal: DISABLED (relay mode only)");
     } else {
-        println!("NAT Traversal: ENABLED");
+        info!("NAT Traversal: ENABLED");
     }
-    println!("==========================================");
+    info!("==========================================");
+    info!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
+    info!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
+    info!("==========================================");
     
     // Create server with cloned values
     let server = RelayServer::new(public_ip.clone(), auth_secret.clone());

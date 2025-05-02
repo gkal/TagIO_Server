@@ -24,8 +24,6 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_BUFFER_SIZE: usize = 8192;
 // Maximum number of unauthorized attempts before logging a warning
 const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
-// Ports to try in order of preference (prioritize Render's default port 10000)
-const PREFERRED_PORTS: [u16; 6] = [10000, 8080, 3000, 443, 80, 8000];
 // Health check server ports
 const HEALTH_CHECK_PORTS: [u16; 3] = [8888, 8080, 3000];
 
@@ -279,10 +277,23 @@ impl RelayServer {
                                 message_data.extend_from_slice(&PROTOCOL_MAGIC);
                                 message_data.extend_from_slice(&data);
                                 
-                                if let Err(e) = write.write_all(&message_data).await {
-                                    error!("Error writing to client {}: {}", addr, e);
+                                // Calculate the total length and prepend it as a 4-byte big-endian uint32
+                                let message_len = message_data.len() as u32;
+                                let len_bytes = message_len.to_be_bytes(); // Big-endian (network) byte order
+                                
+                                // First write the length prefix
+                                if let Err(e) = write.write_all(&len_bytes).await {
+                                    error!("Error writing length prefix to client {}: {}", addr, e);
                                     break;
                                 }
+                                
+                                // Then write the actual message (magic bytes + serialized data)
+                                if let Err(e) = write.write_all(&message_data).await {
+                                    error!("Error writing message to client {}: {}", addr, e);
+                                    break;
+                                }
+                                
+                                trace!("Successfully sent message with length {} to {}", message_len, addr);
                             }
                             Err(e) => {
                                 error!("Error serializing message for {}: {}", addr, e);

@@ -4,9 +4,6 @@
 // Using Render's recommended port 10000 for free tier compatibility
 pub const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:10000";
 
-// Cloud server address for clients to connect to - update to use port 10000
-pub const DEFAULT_RELAY_SERVER: &str = "tagio-server.onrender.com:10000";
-
 // Fallback port for the server - clients may try this if 10000 fails
 pub const FALLBACK_PORT: u16 = 443;
 
