@@ -121,7 +121,23 @@ async fn main() -> Result<()> {
     } else {
         env::set_var("RUST_LOG", "warn");
     }
-    env_logger::init();
+    
+    // Initialize custom logger with [ T ] prefix for easy identification in Render's logs
+    env_logger::builder()
+        .format(|buf, record| {
+            let timestamp = buf.timestamp();
+            let level = record.level();
+            let target = record.target();
+            writeln!(
+                buf,
+                "[ T ] {} {} {} - {}",
+                timestamp,
+                level,
+                target,
+                record.args()
+            )
+        })
+        .init();
     
     info!("Starting TagIO relay server initialization...");
     

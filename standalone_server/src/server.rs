@@ -14,7 +14,8 @@ use crate::messages::{NatMessage, NatTraversalType, NatType, PROTOCOL_VERSION};
 use crate::constants::{
     DEFAULT_AUTH_SECRET,
     PROTOCOL_MAGIC,
-    MAX_PORT_PREDICTION_RANGE
+    MAX_PORT_PREDICTION_RANGE,
+    FALLBACK_PORT,
 };
 
 // Keep alive timeout
@@ -67,95 +68,81 @@ impl RelayServer {
         
         // Try to extract the IP part without the port
         let base_ip = match bind_addr.rsplit_once(':') {
-            Some((ip, _)) => ip.to_string(),
-            None => "0.0.0.0".to_string() // Default to all interfaces if format is invalid
+            Some((ip, port_str)) => {
+                let port = port_str.parse::<u16>().unwrap_or(10000);
+                (ip.to_string(), port)
+            },
+            None => ("0.0.0.0".to_string(), 10000) // Default to all interfaces if format is invalid
         };
         
-        info!("Base IP for binding: {}", base_ip);
+        info!("Base IP for binding: {}", base_ip.0);
         
         // Start health check server on a separate task
-        let health_server = Self::start_health_check_server(base_ip.clone());
+        let health_server = Self::start_health_check_server(base_ip.0.clone());
         tokio::spawn(health_server);
         
-        // Try to bind to the user-provided address first
-        let listener_result = TcpListener::bind(bind_addr).await;
+        // Attempt to bind to the primary port
+        let primary_addr = format!("{}:{}", base_ip.0, base_ip.1);
+        let primary_listener_result = TcpListener::bind(&primary_addr).await;
         
-        let listener = match listener_result {
+        // Also attempt to bind to the fallback port (443) if different
+        let fallback_addr = format!("{}:{}", base_ip.0, FALLBACK_PORT);
+        let fallback_listener_result = if base_ip.1 != FALLBACK_PORT {
+            TcpListener::bind(&fallback_addr).await.ok()
+        } else {
+            None
+        };
+        
+        // Check if either binding succeeded
+        let primary_listener = match primary_listener_result {
             Ok(listener) => {
-                info!("Successfully bound to requested address: {}", bind_addr);
-                listener
+                info!("Successfully bound to primary address: {}", primary_addr);
+                Some(listener)
             },
-            Err(initial_err) => {
-                warn!("Failed to bind to requested address {}: {}", bind_addr, initial_err);
-                warn!("Attempting to bind to alternative ports...");
-                
-                // Try binding to alternative ports
-                let mut last_error = initial_err;
-                let mut success = false;
-                let mut bound_port = 0;
-                
-                for port in PREFERRED_PORTS.iter() {
-                    let alt_addr = format!("{}:{}", base_ip, port);
-                    match TcpListener::bind(&alt_addr).await {
-                        Ok(_listener) => {
-                            info!("Successfully bound to alternative address: {}", alt_addr);
-                            bound_port = *port;
-                            success = true;
-                            break;
-                        },
-                        Err(e) => {
-                            warn!("Failed to bind to {}: {}", alt_addr, e);
-                            last_error = e;
-                        }
-                    }
-                }
-                
-                if !success {
-                    error!("Failed to bind to any port. Last error: {}", last_error);
-                    return Err(anyhow!("Failed to bind to any port: {}", last_error));
-                }
-                
-                // Bind to the successful port
-                let final_addr = format!("{}:{}", base_ip, bound_port);
-                TcpListener::bind(&final_addr).await?
+            Err(e) => {
+                warn!("Failed to bind to primary address {}: {}", primary_addr, e);
+                None
             }
         };
         
-        let local_addr = listener.local_addr()?;
-        info!("Server successfully bound and listening on {}", local_addr);
+        let fallback_listener = match fallback_listener_result {
+            Some(listener) => {
+                info!("Successfully bound to fallback address: {}", fallback_addr);
+                Some(listener)
+            },
+            None => {
+                if base_ip.1 != FALLBACK_PORT {
+                    warn!("Failed to bind to fallback address {}", fallback_addr);
+                }
+                None
+            }
+        };
         
-        if let Some(public_ip) = &self.public_ip {
-            info!("Server configured with explicit public IP: {}", public_ip);
-            info!("Using this IP for all NAT traversal operations");
-        } else {
-            warn!("No public IP configured. NAT traversal will use cloud provider's assigned IP.");
-            info!("For cloud deployment, the server will determine client's public addresses automatically.");
+        // Ensure we have at least one working listener
+        if primary_listener.is_none() && fallback_listener.is_none() {
+            error!("Failed to bind to any port");
+            return Err(anyhow!("Failed to bind to any port"));
         }
         
-        info!("Server ready to accept client connections from around the world");
+        // Spawn tasks to handle connections on both ports
+        let server_clone = self.clone();
+        if let Some(listener) = primary_listener {
+            let server_for_primary = server_clone.clone();
+            tokio::spawn(async move {
+                server_for_primary.accept_connections(listener).await;
+            });
+        }
         
-        // Accept incoming connections
+        if let Some(listener) = fallback_listener {
+            let server_for_fallback = server_clone.clone();
+            tokio::spawn(async move {
+                server_for_fallback.accept_connections(listener).await;
+            });
+        }
+        
+        // Wait indefinitely
         loop {
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    debug!("New connection from client at {}", addr);
-                    
-                    // Clone necessary state for the client handler
-                    let server = self.clone();
-                    
-                    // Handle each client in a separate task
-                    tokio::spawn(async move {
-                        if let Err(e) = server.handle_client(socket, addr).await {
-                            error!("Error handling client {}: {}", addr, e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                    // Small delay to prevent tight loop in case of persistent error
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     }
     
@@ -231,12 +218,11 @@ impl RelayServer {
     async fn handle_client(&self, socket: TcpStream, addr: SocketAddr) -> Result<()> {
         trace!("Handling new client connection from {}", addr);
         
-        // Get socket info for later use
         let peer_addr = socket.peer_addr()?;
         
-        // Establish the public address to use for NAT traversal
+        // Determine public address for this client (for NAT traversal)
         let public_addr = if let Some(ip_str) = &self.public_ip {
-            match ip_str.parse() {
+            match ip_str.parse::<IpAddr>() {
                 Ok(ip) => SocketAddr::new(ip, peer_addr.port()),
                 Err(_) => {
                     warn!("Invalid configured public IP: {}. Using client reported address.", ip_str);
@@ -268,6 +254,7 @@ impl RelayServer {
                     if check_http {
                         match tokio::time::timeout(Duration::from_millis(1), http_rx.recv()).await {
                             Ok(Some(http_response)) => {
+                                debug!("Sending HTTP response to {}", addr);
                                 if let Err(e) = write.write_all(http_response.as_bytes()).await {
                                     error!("Error writing HTTP response to {}: {}", addr, e);
                                     break;
@@ -320,6 +307,8 @@ impl RelayServer {
         let mut authenticated = false;
         let mut _version_checked = false;
         
+        info!("PROTOCOL CHECK: Waiting for client {} to identify protocol", addr);
+        
         // Process messages from the client
         loop {
             // Read with timeout to detect dead connections
@@ -341,7 +330,7 @@ impl RelayServer {
                         buffer.starts_with(b"DELETE ") ||
                         buffer.starts_with(b"OPTIONS ")
                     ) {
-                        info!("Received HTTP request from {}, sending health response", addr);
+                        info!("PROTOCOL DETECTED: HTTP client from {}, sending health response", addr);
                         let response = "HTTP/1.1 200 OK\r\n\
                                        Content-Type: text/plain\r\n\
                                        Content-Length: 36\r\n\
@@ -354,14 +343,69 @@ impl RelayServer {
                         break;
                     }
                     
+                    // First check if this might be the client's first message with authentication
+                    // The client might not be adding magic bytes properly, try to handle auth specially
+                    if !authenticated && n > 0 {
+                        // Try to deserialize assuming it might be an auth message without magic bytes
+                        match bincode::deserialize::<NatMessage>(&buffer[..n]) {
+                            Ok(NatMessage::Authenticate { secret, client_id: id }) => {
+                                info!("Received potential direct auth message from {} for client ID {}", addr, id);
+                                
+                                // Even in a cloud environment, verify authentication
+                                if secret == self.auth_secret {
+                                    authenticated = true;
+                                    client_id = id.clone();
+                                    debug!("Client {} authenticated with ID {}", addr, client_id);
+                                    
+                                    // Register the client in our tracking system
+                                    if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
+                                        error!("Failed to register client {}: {}", client_id, e);
+                                        if let Err(e) = control_tx.send(NatMessage::Error { 
+                                            message: format!("Registration failed: {}", e) 
+                                        }).await {
+                                            error!("Failed to send registration error: {}", e);
+                                        }
+                                        break;
+                                    }
+                                    
+                                    // Confirm authentication
+                                    if let Err(e) = control_tx.send(NatMessage::AuthAck { 
+                                        public_addr,
+                                        message: "Authentication successful".to_string()
+                                    }).await {
+                                        error!("Failed to send auth response: {}", e);
+                                        break;
+                                    }
+                                    
+                                    continue;
+                                } else {
+                                    // Authentication failed
+                                    warn!("AUTH FAIL: Invalid authentication from {}", addr);
+                                    self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst);
+                                    
+                                    if let Err(e) = control_tx.send(NatMessage::AuthError { 
+                                        message: "Invalid authentication token".to_string()
+                                    }).await {
+                                        error!("Failed to send auth failure response: {}", e);
+                                    }
+                                    
+                                    break;
+                                }
+                            },
+                            _ => {
+                                // Not a valid auth message, continue with normal protocol check
+                            }
+                        }
+                    }
+                    
                     // Verify magic bytes for the TagIO protocol
                     if n < PROTOCOL_MAGIC.len() || &buffer[..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
                         // This is normal for health check systems - log at debug level for automated checks
                         if addr.ip().is_loopback() {
-                            debug!("Connection from localhost ({}) with non-TagIO protocol", addr);
+                            info!("PROTOCOL MISMATCH: Connection from localhost ({}) with non-TagIO protocol", addr);
                         } else {
                             // For non-localhost, still warn as it could be an actual issue
-                            warn!("Invalid protocol magic bytes from {}", addr);
+                            warn!("PROTOCOL MISMATCH: Invalid protocol magic bytes from {}", addr);
                         }
                         
                         // Try to send a response anyway if it looks like a valid connection
@@ -377,6 +421,11 @@ impl RelayServer {
                             }
                         }
                         break;
+                    }
+                    
+                    // Successfully received TagIO protocol data
+                    if !authenticated {
+                        info!("PROTOCOL DETECTED: Valid TagIO client from {}, processing message", addr);
                     }
                     
                     // Deserialize the message (skip the magic bytes)
@@ -432,14 +481,14 @@ impl RelayServer {
                                     }
                                 },
                                 
-                                // Authentication message
+                                // Authentication message - improve logging
                                 NatMessage::Authenticate { secret, client_id: id } => {
                                     // Even in a cloud environment, verify authentication
                                     if secret == self.auth_secret {
                                         authenticated = true;
                                         client_id = id;
                                         
-                                        info!("Client {} authenticated from {}", client_id, addr);
+                                        info!("AUTH SUCCESS: Client {} authenticated from {}", client_id, addr);
                                         
                                         // Register the client with its public address
                                         if let Err(e) = self.register_client(client_id.clone(), public_addr, control_tx.clone()).await {
@@ -459,7 +508,9 @@ impl RelayServer {
                                         // Track unauthorized attempts
                                         let attempts = self.unauthorized_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                                         if attempts % MAX_UNAUTHORIZED_ATTEMPTS == 0 {
-                                            warn!("Multiple unauthorized authentication attempts: {}", attempts);
+                                            warn!("AUTH FAIL: Multiple unauthorized authentication attempts: {}", attempts);
+                                        } else {
+                                            warn!("AUTH FAIL: Invalid authentication from {}", addr);
                                         }
                                         
                                         // Send error
@@ -816,6 +867,52 @@ impl RelayServer {
         }
         
         Ok(())
+    }
+
+    // New method to handle accepting connections on a listener
+    async fn accept_connections(&self, listener: TcpListener) {
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("Failed to get local address: {}", e);
+                return;
+            }
+        };
+        
+        info!("Server now accepting connections on {}", local_addr);
+        
+        if let Some(public_ip) = &self.public_ip {
+            info!("Server configured with explicit public IP: {}", public_ip);
+            info!("Using this IP for all NAT traversal operations");
+        } else {
+            warn!("No public IP configured. NAT traversal will use cloud provider's assigned IP.");
+            info!("For cloud deployment, the server will determine client's public addresses automatically.");
+        }
+        
+        // Accept incoming connections
+        loop {
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    // Enhance logging with more descriptive information
+                    info!("NEW CONNECTION: Client connected from {}", addr);
+                    
+                    // Clone necessary state for the client handler
+                    let server = self.clone();
+                    
+                    // Handle each client in a separate task
+                    tokio::spawn(async move {
+                        if let Err(e) = server.handle_client(socket, addr).await {
+                            error!("Error handling client {}: {}", addr, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
+                    // Small delay to prevent tight loop in case of persistent error
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 }
 
