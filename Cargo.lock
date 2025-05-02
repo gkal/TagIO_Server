@@ -1309,6 +1309,7 @@ dependencies = [
  "env_logger",
  "local-ip-address",
  "log",
+ "regex",
  "serde",
  "socket2",
  "tokio",

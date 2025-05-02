@@ -14,6 +14,107 @@ mod constants;
 mod messages;
 mod server;
 
+// Custom logging filter module
+mod log_filter {
+    use log::{Record, Metadata, Level, LevelFilter};
+    use std::net::IpAddr;
+    use std::str::FromStr;
+    
+    // Function to check if a log message contains a localhost IP
+    pub fn contains_localhost(message: &str) -> bool {
+        message.contains("127.0.0.1") || 
+        message.contains("localhost") ||
+        // Also check for IPv6 localhost
+        message.contains("::1")
+    }
+    
+    // Check if an IP address string represents localhost
+    pub fn is_localhost_ip(ip_str: &str) -> bool {
+        if let Ok(ip) = IpAddr::from_str(ip_str) {
+            ip.is_loopback()
+        } else {
+            // Check for common localhost strings
+            ip_str == "localhost" || ip_str.starts_with("127.")
+        }
+    }
+    
+    // Extract any IP address from a log message
+    pub fn extract_ip(message: &str) -> Option<String> {
+        // Common IP address patterns
+        let patterns = [
+            r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", // IPv4
+            r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b", // IPv6
+            r"\blocalhost\b" // Literal localhost
+        ];
+        
+        for pattern in patterns {
+            if let Some(captures) = regex::Regex::new(pattern)
+                .ok()
+                .and_then(|re| re.captures(message)) {
+                if let Some(m) = captures.get(0) {
+                    return Some(m.as_str().to_string());
+                }
+            }
+        }
+        None
+    }
+    
+    // Custom logger that filters out localhost messages
+    pub struct LocalhostFilter {
+        inner: env_logger::Logger,
+    }
+    
+    impl log::Log for LocalhostFilter {
+        fn enabled(&self, metadata: &Metadata) -> bool {
+            self.inner.enabled(metadata)
+        }
+        
+        fn log(&self, record: &Record) {
+            // Skip any logs containing localhost references
+            let message = format!("{}", record.args());
+            
+            // Check for localhost in the message
+            if contains_localhost(&message) {
+                return;
+            }
+            
+            // Extract IP and check if it's localhost
+            if let Some(ip) = extract_ip(&message) {
+                if is_localhost_ip(&ip) {
+                    return;
+                }
+            }
+            
+            // Forward to inner logger
+            self.inner.log(record);
+        }
+        
+        fn flush(&self) {
+            self.inner.flush();
+        }
+    }
+    
+    // Initialize with our filter
+    pub fn init(log_level: Option<LevelFilter>) -> Result<(), log::SetLoggerError> {
+        let level = log_level.unwrap_or(LevelFilter::Info);
+        
+        let env_logger = env_logger::Builder::new()
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(buf, "[ T ] {} | {}", record.level(), record.args())
+            })
+            .filter(None, level)
+            .build();
+        
+        let logger = LocalhostFilter { inner: env_logger };
+        
+        log::set_boxed_logger(Box::new(logger))?;
+        log::set_max_level(level);
+        
+        Ok(())
+    }
+}
+
 use constants::DEFAULT_BIND_ADDRESS;
 use server::RelayServer;
 use messages::PROTOCOL_VERSION;
@@ -121,25 +222,23 @@ async fn main() -> Result<()> {
     // Check if running in Render cloud environment
     let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
     
-    // Configure logging - ensure it's verbose in cloud environments
-    if args.verbose || is_render {
+    // Configure log level - ensure it's verbose in cloud environments
+    let log_level = if args.verbose || is_render {
         // Use verbose logging in Render environment
         if is_render {
             println!("RENDER ENV: Setting TRACE log level");
-            env::set_var("RUST_LOG", "trace");
+            log::LevelFilter::Trace
         } else {
-            env::set_var("RUST_LOG", "info");
+            log::LevelFilter::Info
         }
     } else {
-        env::set_var("RUST_LOG", "warn");
-    }
+        log::LevelFilter::Warn
+    };
     
-    // Initialize custom logger with simple prefix
-    env_logger::builder()
-        .format(|buf, record| {
-            writeln!(buf, "[ T ] {} | {}", record.level(), record.args())
-        })
-        .init();
+    // Initialize custom logger with localhost filtering
+    if let Err(e) = log_filter::init(Some(log_level)) {
+        eprintln!("Warning: Failed to initialize logger: {}", e);
+    }
     
     println!("LOGGER: Initialized");
     info!("Starting TagIO relay server initialization...");
@@ -171,9 +270,23 @@ async fn main() -> Result<()> {
         let port = cloud_port.unwrap();
         println!("CLOUD PORT: Using environment PORT={}", port);
         bind_addr = format!("0.0.0.0:{}", port);
+        
+        // Make sure users know the correct port to use for clients
+        if is_render {
+            println!("RENDER NOTE: Although binding to port {}, external clients should connect on port 443", port);
+            info!("IMPORTANT: TagIO clients should connect to tagio.onrender.com:443 (not port {})", port);
+        }
     } else if let Some(ref b) = args.bind {
         // Command-line bind address overrides defaults
         bind_addr = b.clone();
+    }
+    
+    // Special handling for Render - force internal binding to port 10000 if not specified otherwise
+    if is_render && cloud_port.is_none() && args.bind.is_none() {
+        bind_addr = "0.0.0.0:10000".to_string();
+        println!("RENDER ENV: Defaulting to standard port 10000 for internal binding");
+        println!("RENDER NOTE: External clients should connect on port 443");
+        info!("IMPORTANT: TagIO clients should connect to tagio.onrender.com:443");
     }
     
     // If interactive mode is enabled, prompt for configuration
@@ -261,6 +374,8 @@ async fn main() -> Result<()> {
     println!("Protocol Version: {}", PROTOCOL_VERSION);
     info!("Bind Address: {}", bind_addr);
     println!("Bind Address: {}", bind_addr);
+    println!("IMPORTANT: Port 10000 must be accessible for TagIO clients to connect");
+    println!("IMPORTANT: Make sure your firewall allows TCP traffic on port 10000");
     if let Some(ip) = &public_ip {
         info!("Public IP: {} (explicitly configured)", ip);
         println!("Public IP: {} (explicitly configured)", ip);
@@ -288,6 +403,10 @@ async fn main() -> Result<()> {
     info!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
     println!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
     info!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
+    println!("PORT NOTE: Clients should connect to port 10000 for TagIO protocol");
+    info!("PORT NOTE: Clients should connect to port 10000 for TagIO protocol");
+    println!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
+    info!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
     println!("==========================================");
     info!("==========================================");
     
