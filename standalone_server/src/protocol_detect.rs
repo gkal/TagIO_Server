@@ -1,10 +1,10 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::net::TcpStream;
 use std::net::SocketAddr;
-use crate::constants::PROTOCOL_MAGIC;
 
 /// Determines if the data in the buffer appears to be an HTTP request
+#[allow(dead_code)]
 pub fn is_http_request(data: &[u8]) -> bool {
     if data.len() < 4 {
         return false;
@@ -21,34 +21,34 @@ pub fn is_http_request(data: &[u8]) -> bool {
     data.starts_with(b"HTTP/")
 }
 
-/// Check if this is a special TagIO protocol over HTTP header
+/// Checks if this is a special TagIO protocol over HTTP header
+#[allow(dead_code)]
 pub fn is_tagio_protocol_http(data: &[u8]) -> bool {
-    if data.len() < 30 {
+    if data.len() < 20 {
         return false;
     }
     
-    // Quick check if this looks like a POST request to /tagio
-    if !data.starts_with(b"POST /tagio HTTP/1.1") {
-        return false;
+    // Check for our special TagIO header:
+    // "POST /tagio HTTP/1.1" and "X-TagIO-Protocol: v1"
+    if data.starts_with(b"POST /tagio HTTP/1.1") {
+        if let Ok(header_str) = std::str::from_utf8(&data[..std::cmp::min(512, data.len())]) {
+            if header_str.contains("X-TagIO-Protocol:") {
+                debug!("Detected TagIO protocol over HTTP header");
+                return true;
+            }
+        }
     }
     
-    // Convert to string to look for TagIO headers
-    if let Ok(header_str) = std::str::from_utf8(data) {
-        // Check for TagIO protocol headers
-        header_str.contains("X-TagIO-Protocol:") &&
-        header_str.contains("Content-Type: application/tagio") &&
-        (header_str.contains("Upgrade: TagIO") || header_str.contains("Connection: Upgrade"))
-    } else {
-        false
-    }
+    false
 }
 
 /// Handles an incoming connection with protocol detection
+#[allow(dead_code)]
 pub async fn handle_connection_with_protocol_detection<R, W>(
     mut reader: R, 
     mut writer: W,
     client_addr: SocketAddr,
-    health_check_path: &str
+    _health_check_path: &str
 ) -> anyhow::Result<(bool, Vec<u8>)>
 where
     R: AsyncRead + Unpin,
@@ -116,6 +116,7 @@ where
 }
 
 /// Handles an incoming HTTP request for the health check
+#[allow(dead_code)]
 pub async fn handle_health_check(
     stream: &mut TcpStream, 
     addr: SocketAddr

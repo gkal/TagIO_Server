@@ -17,6 +17,11 @@ use crate::constants::{
     MAX_PORT_PREDICTION_RANGE,
     FALLBACK_PORT,
 };
+use hyper::{Body, Request, Response, StatusCode, service::service_fn};
+use hyper::service::make_service_fn;
+use std::convert::Infallible;
+use crate::protocol_detect;
+use crate::http_tunnel;
 
 // Keep alive timeout
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -28,6 +33,14 @@ const HEALTH_CHECK_PORTS: [u16; 3] = [8888, 8080, 3000];
 // Add allow attribute to silence the warning
 #[allow(dead_code)]
 const MAX_UNAUTHORIZED_ATTEMPTS: usize = 10;
+
+// Define protocol modes for the server
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProtocolMode {
+    Standard,
+    HttpTunneling,
+}
 
 // Information about a connected client
 struct ClientInfo {
@@ -48,6 +61,7 @@ pub struct RelayServer {
     public_ip: Option<String>, // Store the server's public IP address
     auth_secret: String, // Authentication secret
     unauthorized_attempts: Arc<AtomicUsize>, // Track unauthorized connection attempts
+    #[allow(dead_code)]
     nat_traversal_enabled: bool, // Whether NAT traversal is enabled
     protocol_detection_enabled: bool, // Whether protocol detection is enabled
 }
@@ -66,6 +80,7 @@ impl RelayServer {
     }
     
     // Set whether NAT traversal is enabled
+    #[allow(dead_code)]
     pub fn set_nat_traversal_enabled(&mut self, enabled: bool) {
         self.nat_traversal_enabled = enabled;
     }
@@ -1123,4 +1138,250 @@ fn is_http_protocol(data: &[u8]) -> bool {
     data.starts_with(b"HEAD") || 
     data.starts_with(b"PUT ") || 
     data.starts_with(b"HTTP")
+}
+
+/// Starts the server in standard mode (direct TCP connections)
+#[allow(dead_code)]
+pub async fn start_server(
+    bind_addr: SocketAddr,
+    public_ip: IpAddr,
+    auth_secret: Option<String>,
+    _enable_nat_traversal: bool,
+    enable_protocol_detection: bool,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let server = RelayServer::new(Some(public_ip.to_string()), auth_secret);
+    
+    let server_handle = tokio::spawn(async move {
+        server.run_standard_mode(&bind_addr, enable_protocol_detection).await
+    });
+    
+    Ok(server_handle)
+}
+
+/// Starts the server with HTTP tunneling support
+#[allow(dead_code)]
+pub async fn start_server_with_http_tunneling(
+    bind_addr: SocketAddr,
+    public_ip: IpAddr,
+    auth_secret: Option<String>,
+    _enable_nat_traversal: bool,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let server = RelayServer::new(Some(public_ip.to_string()), auth_secret);
+    
+    let server_handle = tokio::spawn(async move {
+        server.run_http_tunneling_mode(&bind_addr).await
+    });
+    
+    Ok(server_handle)
+}
+
+/// Dummy implementation - this will be replaced with actual functionality
+#[allow(dead_code)]
+async fn handle_http_request(_socket: TcpStream, _buffer: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Dummy implementation - this will be replaced with actual functionality
+#[allow(dead_code)]
+async fn handle_tagio_connection(_socket: TcpStream, _buffer: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+impl RelayServer {
+    /// Run the server in standard mode (direct TCP connections)
+    #[allow(dead_code)]
+    pub async fn run_standard_mode(&self, bind_addr: &SocketAddr, enable_protocol_detection: bool) -> Result<()> {
+        // Bind to the specified address
+        let listener = TcpListener::bind(bind_addr).await?;
+        info!("Successfully bound to primary address: {}", bind_addr);
+        
+        // Create a health check HTTP server for the relay server
+        Self::start_health_check_server(bind_addr.ip().to_string()).await?;
+        
+        // Accept and handle connections
+        info!("Server now accepting connections on {}", bind_addr);
+        if let Some(public_ip) = &self.public_ip {
+            info!("Server configured with explicit public IP: {}", public_ip);
+            info!("Using this IP for all NAT traversal operations");
+        }
+        
+        loop {
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    let server = self.clone();
+                    
+                    // Handle each client in a separate task
+                    tokio::spawn(async move {
+                        if enable_protocol_detection {
+                            if let Err(e) = server.handle_connection_with_protocol_detection(socket, addr).await {
+                                error!("Error handling connection from {}: {}", addr, e);
+                            }
+                        } else {
+                            if let Err(e) = server.handle_client(socket, addr).await {
+                                error!("Error handling connection from {}: {}", addr, e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
+                }
+            }
+        }
+    }
+    
+    /// Alias for handle_client to maintain compatibility
+    #[allow(dead_code)]
+    pub async fn handle_connection(&self, socket: TcpStream, addr: SocketAddr) -> Result<()> {
+        self.handle_client(socket, addr).await
+    }
+    
+    /// Run the server with HTTP tunneling support
+    #[allow(dead_code)]
+    pub async fn run_http_tunneling_mode(&self, bind_addr: &SocketAddr) -> Result<()> {
+        // Create a channel for communication between HTTP handler and TagIO protocol handler
+        let (tagio_tx, mut tagio_rx) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>(100);
+        let tagio_tx = Arc::new(TokioMutex::new(Some(tagio_tx)));
+        
+        // Create a clone of the server for the TagIO protocol handler
+        let server = self.clone();
+        
+        // Start the TagIO protocol handler
+        let protocol_handler = tokio::spawn(async move {
+            info!("Starting TagIO protocol handler for HTTP tunneling");
+            
+            while let Some((request_bytes, response_tx)) = tagio_rx.recv().await {
+                // Process the TagIO protocol message
+                match server.handle_binary_message(request_bytes).await {
+                    Ok(response) => {
+                        if let Err(e) = response_tx.send(response).await {
+                            error!("Failed to send TagIO response: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error processing TagIO message: {}", e);
+                        // Send an error response
+                        let error_msg = format!("Error: {}", e);
+                        if let Err(e) = response_tx.send(error_msg.into_bytes()).await {
+                            error!("Failed to send TagIO error response: {}", e);
+                        }
+                    }
+                }
+            }
+            
+            info!("TagIO protocol handler shut down");
+            Ok::<(), anyhow::Error>(())
+        });
+        
+        // Start the health check server on a different port
+        Self::start_health_check_server(bind_addr.ip().to_string()).await?;
+        
+        // Create the HTTP server
+        let addr = bind_addr.clone();
+        
+        // Create a modified version of handle_tagio_over_http that accepts our channel
+        let make_svc = make_service_fn(move |_conn| {
+            let tagio_tx = tagio_tx.clone();
+            
+            async {
+                Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                    let _tagio_tx = tagio_tx.clone();
+                    
+                    async move {
+                        // Route the request
+                        match (req.method(), req.uri().path()) {
+                            (&hyper::Method::GET, "/") | (&hyper::Method::GET, "/status") => {
+                                http_tunnel::serve_status_page().await
+                            }
+                            (_, "/tagio") => {
+                                // Handle with standard function for now
+                                http_tunnel::handle_tagio_over_http(req).await
+                            }
+                            _ => {
+                                // Return 404 for any other path
+                                Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Body::from("Not Found"))
+                                    .unwrap())
+                            }
+                        }
+                    }
+                }))
+            }
+        });
+        
+        // Create and run the HTTP server
+        let server = hyper::Server::bind(&addr)
+            .serve(make_svc);
+        
+        info!("HTTP tunneling server listening on {}", addr);
+        
+        // Run the HTTP server
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+        }
+        
+        // Wait for the protocol handler to finish
+        if let Err(e) = protocol_handler.await {
+            error!("Protocol handler error: {}", e);
+        }
+        
+        Ok(())
+    }
+    
+    /// Process a TagIO protocol binary message
+    #[allow(dead_code)]
+    async fn handle_binary_message(&self, request_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        // Check if the message has the TagIO protocol magic bytes
+        if request_bytes.len() < 4 + PROTOCOL_MAGIC.len() {
+            return Err(anyhow!("Message too short"));
+        }
+        
+        // Skip the first 4 bytes (length) and check the magic bytes
+        let magic_start = 4;
+        let magic_end = magic_start + PROTOCOL_MAGIC.len();
+        
+        if request_bytes[magic_start..magic_end] != PROTOCOL_MAGIC[..] {
+            return Err(anyhow!("Invalid protocol magic bytes"));
+        }
+        
+        // For now, just echo back the request with an acknowledgment
+        let mut response_bytes = Vec::with_capacity(request_bytes.len() + 32);
+        response_bytes.extend_from_slice(&PROTOCOL_MAGIC);
+        response_bytes.extend_from_slice(b"ACKNOWLEDGED");
+        response_bytes.extend_from_slice(&request_bytes);
+        
+        Ok(response_bytes)
+    }
+    
+    /// Handle a connection with protocol detection (HTTP or TagIO)
+    #[allow(dead_code)]
+    async fn handle_connection_with_protocol_detection(&self, mut socket: TcpStream, addr: SocketAddr) -> Result<()> {
+        // Read the first few bytes to detect the protocol
+        let mut buffer = [0u8; 512];
+        let n = match socket.read(&mut buffer).await {
+            Ok(n) => {
+                if n == 0 {
+                    return Err(anyhow!("Connection closed before protocol detection"));
+                }
+                n
+            }
+            Err(e) => return Err(anyhow!("Failed to read from socket: {}", e)),
+        };
+        
+        debug!("Read {} bytes for protocol detection", n);
+        
+        // Check if this is an HTTP request
+        if protocol_detect::is_http_request(&buffer[..n]) {
+            debug!("Detected HTTP request from {}", addr);
+            handle_http_request(socket, &buffer[..n]).await
+        } else if protocol_detect::is_tagio_protocol_http(&buffer[..n]) {
+            debug!("Detected TagIO over HTTP header from {}", addr);
+            handle_tagio_connection(socket, &buffer[..n]).await
+        } else {
+            // Assume it's a TagIO protocol connection
+            debug!("Detected TagIO protocol connection from {}", addr);
+            self.handle_connection(socket, addr).await
+        }
+    }
 } 

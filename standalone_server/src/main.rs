@@ -3,121 +3,23 @@
 #![cfg(feature = "server")]
 
 use std::env;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::io::{self, Write};
 use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use log::{info, warn};
 use clap::{Parser, ArgAction};
+use tokio;
 
 mod constants;
 mod messages;
 mod server;
+mod protocol_detect;
+mod http_tunnel;
 
 // Custom logging filter module
-mod log_filter {
-    use log::{Record, Metadata, LevelFilter};
-    use std::net::IpAddr;
-    use std::str::FromStr;
-    
-    // Function to check if a log message contains a localhost IP
-    pub fn contains_localhost(message: &str) -> bool {
-        message.contains("127.0.0.1") || 
-        message.contains("localhost") ||
-        // Also check for IPv6 localhost
-        message.contains("::1")
-    }
-    
-    // Check if an IP address string represents localhost
-    pub fn is_localhost_ip(ip_str: &str) -> bool {
-        if let Ok(ip) = IpAddr::from_str(ip_str) {
-            ip.is_loopback()
-        } else {
-            // Check for common localhost strings
-            ip_str == "localhost" || ip_str.starts_with("127.")
-        }
-    }
-    
-    // Extract any IP address from a log message
-    pub fn extract_ip(message: &str) -> Option<String> {
-        // Common IP address patterns
-        let patterns = [
-            r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", // IPv4
-            r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b", // IPv6
-            r"\blocalhost\b" // Literal localhost
-        ];
-        
-        for pattern in patterns {
-            if let Some(captures) = regex::Regex::new(pattern)
-                .ok()
-                .and_then(|re| re.captures(message)) {
-                if let Some(m) = captures.get(0) {
-                    return Some(m.as_str().to_string());
-                }
-            }
-        }
-        None
-    }
-    
-    // Custom logger that filters out localhost messages
-    pub struct LocalhostFilter {
-        inner: env_logger::Logger,
-    }
-    
-    impl log::Log for LocalhostFilter {
-        fn enabled(&self, metadata: &Metadata) -> bool {
-            self.inner.enabled(metadata)
-        }
-        
-        fn log(&self, record: &Record) {
-            // Skip any logs containing localhost references
-            let message = format!("{}", record.args());
-            
-            // Check for localhost in the message
-            if contains_localhost(&message) {
-                return;
-            }
-            
-            // Extract IP and check if it's localhost
-            if let Some(ip) = extract_ip(&message) {
-                if is_localhost_ip(&ip) {
-                    return;
-                }
-            }
-            
-            // Forward to inner logger
-            self.inner.log(record);
-        }
-        
-        fn flush(&self) {
-            self.inner.flush();
-        }
-    }
-    
-    // Initialize with our filter
-    pub fn init(log_level: Option<LevelFilter>) -> Result<(), log::SetLoggerError> {
-        let level = log_level.unwrap_or(LevelFilter::Info);
-        
-        let env_logger = env_logger::Builder::new()
-            .format(|buf, record| {
-                use std::io::Write;
-                writeln!(buf, "[ T ] {} | {}", record.level(), record.args())
-            })
-            .filter(None, level)
-            .build();
-        
-        let logger = LocalhostFilter { inner: env_logger };
-        
-        log::set_boxed_logger(Box::new(logger))?;
-        log::set_max_level(level);
-        
-        Ok(())
-    }
-}
-
-use constants::DEFAULT_BIND_ADDRESS;
-use server::RelayServer;
-use messages::PROTOCOL_VERSION;
+#[allow(dead_code)]
+mod logging_filter;
 
 // Cloud server's known public IP address - set this explicitly for NAT traversal
 const CLOUD_SERVER_IP: &str = "18.156.158.53";
@@ -158,9 +60,14 @@ struct CliArgs {
     /// Enable protocol detection to handle both HTTP and TagIO traffic on the same port
     #[clap(long, action = ArgAction::SetTrue)]
     enable_protocol_detection: bool,
+
+    /// Enable HTTP tunneling for TagIO protocol
+    #[clap(long, default_value_t = false)]
+    enable_http_tunneling: bool,
 }
 
 /// Prompt for user input with a given message
+#[allow(dead_code)]
 fn prompt_input(prompt: &str) -> String {
     print!("{}: ", prompt);
     io::stdout().flush().unwrap();
@@ -170,6 +77,7 @@ fn prompt_input(prompt: &str) -> String {
 }
 
 /// Attempt to detect the public IP address
+#[allow(dead_code)]
 async fn detect_public_ip() -> Result<String> {
     // Try different services for public IP detection
     let services = vec![
@@ -200,6 +108,7 @@ async fn detect_public_ip() -> Result<String> {
 }
 
 /// Prompt for yes/no confirmation
+#[allow(dead_code)]
 fn prompt_yes_no(prompt: &str) -> bool {
     loop {
         print!("{} (y/n): ", prompt);
@@ -216,237 +125,101 @@ fn prompt_yes_no(prompt: &str) -> bool {
 
 /// Main entry point
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Parse command line arguments
-    let args = CliArgs::parse();
-    
-    // Print banner immediately to console
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Print the title banner
     println!("===== STARTING TAGIO RELAY SERVER v{} =====", env!("CARGO_PKG_VERSION"));
     
-    // Check if running in Render cloud environment
-    let is_render = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
+    // Parse the command line arguments
+    let args = CliArgs::parse();
     
-    // Configure log level - ensure it's verbose in cloud environments
-    let log_level = if args.verbose || is_render {
-        // Use verbose logging in Render environment
-        if is_render {
+    // Set up the logger
+    let log_level = match args.verbose {
+        true => {
             println!("RENDER ENV: Setting TRACE log level");
             log::LevelFilter::Trace
-        } else {
-            log::LevelFilter::Info
         }
-    } else {
-        log::LevelFilter::Warn
+        false => log::LevelFilter::Info,
     };
     
     // Initialize custom logger with localhost filtering
-    if let Err(e) = log_filter::init(Some(log_level)) {
+    if let Err(e) = logging_filter::init(Some(log_level)) {
         eprintln!("Warning: Failed to initialize logger: {}", e);
     }
     
     println!("LOGGER: Initialized");
     info!("Starting TagIO relay server initialization...");
     
-    // Initialize variables with default values
-    let mut bind_addr = DEFAULT_BIND_ADDRESS.to_string();
-    let mut public_ip = None;
-    let mut auth_secret = None;
+    // Determine if we're running in a cloud environment
+    let is_cloud_env = env::var("RENDER").is_ok() || args.force_cloud_ip;
     
-    // Check if we're running in a cloud environment
-    let is_cloud = env::var("RENDER").is_ok() || env::var("RENDER_SERVICE_ID").is_ok();
-    
-    // If running in cloud environment or force_cloud_ip flag is set, use the known public IP
-    if args.force_cloud_ip || is_cloud {
+    // Get the public IP address
+    let public_ip = if let Some(ip) = args.public_ip {
+        info!("Using provided public IP: {}", ip);
+        Some(ip)
+    } else if is_cloud_env {
         info!("Cloud environment detected or cloud IP forced - using known cloud server IP");
         println!("CLOUD MODE: Using cloud server IP {}", CLOUD_SERVER_IP);
-        public_ip = Some(CLOUD_SERVER_IP.to_string());
-    }
-    
-    // Try to get the PORT environment variable for cloud environments
-    let cloud_port = env::var("PORT").ok().and_then(|port_str| port_str.parse::<u16>().ok());
-    
-    // Define preferred ports for binding in order of preference
-    // Non-privileged ports first, then fallback to privileged ones if running with sufficient permissions
-    let _preferred_ports = [10000, 8080, 3000, 443, 80];
-    
-    // In a cloud environment, prioritize the PORT environment variable if available
-    if is_cloud && cloud_port.is_some() {
-        let port = cloud_port.unwrap();
-        println!("CLOUD PORT: Using environment PORT={}", port);
-        bind_addr = format!("0.0.0.0:{}", port);
-        
-        // Make sure users know the correct port to use for clients
-        if is_render {
-            println!("RENDER NOTE: Although binding to port {}, external clients should connect on port 443", port);
-            info!("IMPORTANT: TagIO clients should connect to tagio.onrender.com:443 (not port {})", port);
-        }
-    } else if let Some(ref b) = args.bind {
-        // Command-line bind address overrides defaults
-        bind_addr = b.clone();
-    }
-    
-    // Special handling for Render - force internal binding to port 10000 if not specified otherwise
-    if is_render && cloud_port.is_none() && args.bind.is_none() {
-        bind_addr = "0.0.0.0:10000".to_string();
-        println!("RENDER ENV: Defaulting to standard port 10000 for internal binding");
-        println!("RENDER NOTE: External clients should connect on port 443");
-        info!("IMPORTANT: TagIO clients should connect to tagio.onrender.com:443");
-    }
-    
-    // If interactive mode is enabled, prompt for configuration
-    if args.interactive {
-        println!("=== TagIO Relay Server Interactive Setup ===");
-        
-        // Bind address
-        let input_bind = prompt_input("Enter bind address (default: 0.0.0.0:10000)");
-        if !input_bind.is_empty() {
-            bind_addr = input_bind;
-        }
-        
-        // Public IP if not already set by force_cloud_ip
-        if public_ip.is_none() {
-            let detect_ip = prompt_yes_no("Attempt to detect public IP?");
-            if detect_ip {
-                match detect_public_ip().await {
-                    Ok(ip) => {
-                        println!("Detected public IP: {}", ip);
-                        if prompt_yes_no("Use this IP?") {
-                            public_ip = Some(ip);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Failed to detect public IP: {}", e);
-                    }
-                }
+        Some(CLOUD_SERVER_IP.to_string())
+    } else {
+        // Auto-detect public IP (simplified - use local IP for this example)
+        match local_ip_address::local_ip() {
+            Ok(ip) => {
+                info!("Auto-detected local IP: {}", ip);
+                Some(ip.to_string())
             }
-            
-            if public_ip.is_none() {
-                let use_cloud_ip = prompt_yes_no("Use cloud server IP (18.156.158.53)?");
-                if use_cloud_ip {
-                    public_ip = Some(CLOUD_SERVER_IP.to_string());
-                } else {
-                    let input_ip = prompt_input("Enter public IP (leave empty to skip)");
-                    if !input_ip.is_empty() {
-                        // Validate the IP
-                        match IpAddr::from_str(&input_ip) {
-                            Ok(_) => public_ip = Some(input_ip),
-                            Err(_) => {
-                                eprintln!("Invalid IP address: {}", input_ip);
-                                return Err(anyhow!("Invalid IP address"));
-                            }
-                        }
-                    }
-                }
+            Err(e) => {
+                warn!("Failed to auto-detect local IP: {}", e);
+                None
             }
         }
-        
-        // Authentication
-        if prompt_yes_no("Enable authentication?") {
-            let secret = prompt_input("Enter authentication secret");
-            if !secret.is_empty() {
-                auth_secret = Some(secret);
-            } else {
-                eprintln!("Empty secret not allowed for authentication");
-                return Err(anyhow!("Empty authentication secret"));
-            }
+    };
+    
+    // Get the port from environment (for cloud deployment) or command line
+    let port = if let Ok(port_str) = env::var("PORT") {
+        info!("Using environment PORT={}", port_str);
+        if is_cloud_env {
+            println!("CLOUD PORT: Using environment PORT={}", port_str);
+            println!("RENDER NOTE: Although binding to port {}, external clients should connect on port 443", port_str);
+            info!("IMPORTANT: TagIO clients should connect to tagio.onrender.com:443 (not port {})", port_str);
         }
+        port_str.parse().unwrap_or(10000)
     } else {
-        // Use command line arguments
-        if let Some(ref b) = args.bind {
-            bind_addr = b.clone();
+        args.bind.and_then(|b| b.parse::<u16>().ok()).unwrap_or(10000)
+    };
+    
+    // Get the authentication secret
+    let auth_secret = args.auth.unwrap_or_else(|| {
+        let secret = "tagio_default_secret".to_string();
+        info!("Using default authentication secret");
+        secret
+    });
+    
+    // Determine the bind address
+    let bind_addr = SocketAddr::new(
+        std::net::IpAddr::from_str("0.0.0.0").unwrap(),
+        port
+    );
+    
+    // Run the server in the appropriate mode
+    if args.enable_http_tunneling {
+        info!("Starting server with HTTP tunneling support on port {}", port);
+        println!("Starting HTTP tunneling server on port {}", port);
+        println!("Clients should POST TagIO protocol messages to /tagio endpoint");
+        http_tunnel::start_http_tunnel_server(bind_addr).await?;
+    } else {
+        // Create and initialize the server
+        let mut server = server::RelayServer::new(public_ip, Some(auth_secret));
+        
+        // Configure protocol detection if enabled
+        if args.enable_protocol_detection {
+            info!("Protocol detection is enabled - server will accept both HTTP and TagIO connections");
+            println!("Protocol detection ENABLED - server will accept both HTTP and TagIO connections");
+            server.set_protocol_detection(true);
         }
         
-        // If not using cloud IP mode, check command line provided IP
-        if public_ip.is_none() {
-            public_ip = args.public_ip;
-        }
-        
-        auth_secret = args.auth;
+        // Run the server
+        server.run(&bind_addr.to_string()).await?;
     }
-    
-    // Always use the cloud server IP when running in the cloud for reliability
-    if public_ip.is_none() && is_cloud {
-        warn!("Running in cloud environment with no public IP specified. Using cloud server IP.");
-        public_ip = Some(CLOUD_SERVER_IP.to_string());
-    }
-    
-    // Run the server - use logger instead of println!
-    info!("Starting TagIO relay server...");
-    println!("===== TagIO Cloud Relay Server v{} =====", env!("CARGO_PKG_VERSION"));
-    info!("=== TagIO Cloud Relay Server v{} ===", env!("CARGO_PKG_VERSION"));
-    info!("Protocol Version: {}", PROTOCOL_VERSION);
-    println!("Protocol Version: {}", PROTOCOL_VERSION);
-    info!("Bind Address: {}", bind_addr);
-    println!("Bind Address: {}", bind_addr);
-    if is_render || is_cloud {
-        // Cloud deployment - clients need to use port 443
-        println!("IMPORTANT: In cloud deployment, clients should connect to port 443");
-        println!("IMPORTANT: Internal binding is port 10000, but external access is via port 443");
-    } else {
-        // Local deployment - clients connect directly to the bound port
-        println!("IMPORTANT: Port 10000 must be accessible for TagIO clients to connect");
-        println!("IMPORTANT: Make sure your firewall allows TCP traffic on port 10000");
-    }
-    if public_ip.is_some() {
-        info!("Public IP: {} (explicitly configured)", public_ip.as_ref().unwrap());
-        println!("Public IP: {} (explicitly configured)", public_ip.as_ref().unwrap());
-    } else {
-        info!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
-        println!("Public IP: Auto-detect mode (may cause NAT traversal issues)");
-    }
-    if auth_secret.is_some() {
-        info!("Authentication: Enabled with custom secret");
-        println!("Authentication: Enabled with custom secret");
-    } else {
-        info!("Authentication: Enabled with default secret");
-        println!("Authentication: Enabled with default secret");
-    }
-    if args.relay_only {
-        info!("NAT Traversal: DISABLED (relay mode only)");
-        println!("NAT Traversal: DISABLED (relay mode only)");
-    } else {
-        info!("NAT Traversal: ENABLED");
-        println!("NAT Traversal: ENABLED");
-    }
-    println!("==========================================");
-    info!("==========================================");
-    println!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
-    info!("PROTOCOL FORMAT: Using length-prefixed messages (4-byte BE uint32 + magic bytes + payload)");
-    println!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
-    info!("CLIENT NOTE: The server now adds a 4-byte length prefix to each message");
-    println!("PORT NOTE: Clients should connect to port 443 for TagIO protocol");
-    info!("PORT NOTE: Clients should connect to port 443 for TagIO protocol");
-    if is_render || is_cloud {
-        println!("PORT NOTE: Port 443 handles both TagIO protocol and HTTP health checks");
-        info!("PORT NOTE: Port 443 handles both TagIO protocol and HTTP health checks");
-    } else {
-        println!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
-        info!("PORT NOTE: Ports 443, 80, and 8888 are for HTTP health checks only");
-    }
-    println!("==========================================");
-    info!("==========================================");
-    
-    // Create server with cloned values
-    let mut server = RelayServer::new(public_ip.clone(), auth_secret.clone());
-    
-    // Set protocol detection flag
-    if args.enable_protocol_detection {
-        println!("PROTOCOL: Enabling protocol detection for distinguishing HTTP and TagIO traffic");
-        info!("Protocol detection enabled for mixed HTTP/TagIO traffic on port 80");
-        server.set_protocol_detection(true);
-    }
-    
-    // Run the server
-    if args.relay_only {
-        server.set_nat_traversal_enabled(false);
-        println!("NAT Traversal: DISABLED - relay only mode");
-        info!("NAT traversal disabled - running in relay-only mode");
-    } else {
-        println!("NAT Traversal: ENABLED");
-        info!("NAT Traversal: ENABLED");
-    }
-    
-    server.run(&bind_addr).await?;
     
     Ok(())
 } 

@@ -1,6 +1,9 @@
 //! Constants for the relay module
 
-// Default bind address for the service
+// Constants shared across server components
+
+// Server bind address
+#[allow(dead_code)]
 pub const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:10000";
 
 // Main protocol binary message header magic bytes - identifies TagIO protocol
