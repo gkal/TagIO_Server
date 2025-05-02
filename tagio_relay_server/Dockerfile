@@ -2,6 +2,13 @@ FROM rust:1.76-slim as builder
 
 WORKDIR /app
 
+# Install dependencies for building
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    pkg-config \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy Cargo manifest files
 COPY Cargo.toml .
 
@@ -11,13 +18,13 @@ RUN mkdir src && \
     echo 'pub mod constants { pub const DEFAULT_BIND_ADDRESS: &str = ""; }' > src/constants.rs && \
     echo 'pub mod messages { pub enum MessageType { AuthFailure = 2, ClientRegistered = 3, ConnectionRequest = 4, ConnectionInfo = 5 } }' > src/messages.rs && \
     echo 'pub mod server { pub struct RelayServer; impl RelayServer { pub fn new(_: Option<String>, _: Option<String>) -> Self { Self } pub async fn run(&self, _: &str) -> anyhow::Result<()> { Ok(()) } } }' > src/server.rs && \
-    cargo build --release
+    cargo build --release --no-default-features --features="server"
 
 # Copy actual source code
 COPY src ./src/
 
 # Build the actual binary
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --no-default-features --features="server"
 
 # Create a minimal runtime image
 FROM debian:bullseye-slim

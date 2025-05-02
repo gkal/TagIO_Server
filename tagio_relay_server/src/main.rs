@@ -1,3 +1,7 @@
+// Server-only binary for TagIO relay server
+// This file should not import any GUI dependencies
+#![cfg(feature = "server")]
+
 use std::env;
 use std::net::IpAddr;
 use std::io::{self, Write};
