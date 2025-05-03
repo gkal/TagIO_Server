@@ -299,24 +299,40 @@ async fn main() -> anyhow::Result<()> {
                 let debug_mode = debug_mode;
                 
                 async move {
-                    // Log all incoming requests with detailed information
-                    info!("Received HTTP request: {} {} from {:?}", 
-                          req.method(), 
-                          req.uri().path(),
-                          req.headers().get("host").map(|h| h.to_str().unwrap_or("unknown")).unwrap_or("unknown"));
+                    // Log all incoming requests with detailed information 
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    let host = req.headers().get("host")
+                        .map(|h| h.to_str().unwrap_or("unknown"))
+                        .unwrap_or("unknown")
+                        .to_string();
+                    
+                    info!("Received HTTP request: {} {} from {:?}", method, path, host);
+                    
+                    // Check Render-specific headers for SSL termination info
+                    let x_forwarded_proto = req.headers().get("x-forwarded-proto")
+                        .map(|h| h.to_str().unwrap_or("unknown"))
+                        .unwrap_or("unknown");
+                    let is_https = x_forwarded_proto == "https";
                     
                     if debug_mode {
-                        debug!("Request headers: {:?}", req.headers());
+                        debug!("X-Forwarded-Proto: {}, Is HTTPS: {}", x_forwarded_proto, is_https);
+                        debug!("All request headers: {:?}", req.headers());
                     }
                     
-                    // Check for TagIO protocol indicators in headers
+                    // Log all important headers related to proxy behavior
+                    info!("Proxy headers - X-Forwarded-Proto: {}, X-Forwarded-For: {:?}, X-Real-IP: {:?}",
+                        x_forwarded_proto,
+                        req.headers().get("x-forwarded-for"),
+                        req.headers().get("x-real-ip"));
+                    
+                    // Check headers for TagIO protocol indicators
                     let headers = req.headers().clone();
                     let is_http_upgrade_to_tagio = extract_tagio_from_http(&headers, &[]);
                     
                     // Special case for GET requests to root or status
                     if req.method() == hyper::Method::GET && 
-                       (req.uri().path() == "/" || req.uri().path() == "/status") && 
-                       !is_http_upgrade_to_tagio {
+                       (req.uri().path() == "/" || req.uri().path() == "/status") {
                         debug!("Serving status page");
                         match serve_status_page().await {
                             Ok(response) => return Ok::<_, hyper::http::Error>(response),
@@ -332,7 +348,16 @@ async fn main() -> anyhow::Result<()> {
 
                     // Get the request body directly
                     let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
-                        Ok(bytes) => bytes.to_vec(),
+                        Ok(bytes) => {
+                            let bytes_vec = bytes.to_vec();
+                            info!("Received request body of {} bytes", bytes_vec.len());
+                            if !bytes_vec.is_empty() && bytes_vec.len() < 100 {
+                                info!("Request body hex dump: {}", hex_dump(&bytes_vec, bytes_vec.len()));
+                            } else if !bytes_vec.is_empty() {
+                                info!("Request body preview: {}", hex_dump(&bytes_vec, 50));
+                            }
+                            bytes_vec
+                        },
                         Err(e) => {
                             error!("Failed to read request body: {}", e);
                             return Ok::<_, hyper::http::Error>(Response::builder()
@@ -342,34 +367,48 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
                     
-                    debug!("Received request body of {} bytes", body_bytes.len());
-                    
                     // Look for TagIO protocol markers in headers or body
                     let is_tagio_magic = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
                                    body_bytes.starts_with(PROTOCOL_MAGIC);
                     
+                    // Always check the entire body for the magic bytes
+                    let has_tagio_magic_anywhere = if !is_tagio_magic && body_bytes.len() >= PROTOCOL_MAGIC.len() {
+                        match find_subsequence(&body_bytes, PROTOCOL_MAGIC) {
+                            Some(pos) => {
+                                info!("Found TagIO magic at position {}", pos);
+                                true
+                            },
+                            None => false
+                        }
+                    } else {
+                        is_tagio_magic
+                    };
+                    
                     let is_tagio = is_tagio_magic || is_http_upgrade_to_tagio || 
-                                   extract_tagio_from_http(&headers, &body_bytes);
+                                   extract_tagio_from_http(&headers, &body_bytes) ||
+                                   has_tagio_magic_anywhere;
                     
                     if is_tagio {
-                        debug!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
-                        info!("Processing TagIO protocol message");
+                        info!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
                         
                         // Skip HTTP headers if they exist, find the TagIO protocol data
                         let actual_body = if !is_tagio_magic && body_bytes.len() > 5 {
                             // Try to find TAGIO marker in the body
                             if let Some(pos) = find_subsequence(&body_bytes, PROTOCOL_MAGIC) {
-                                debug!("Found TagIO magic at position {}", pos);
+                                debug!("Using TagIO data starting at position {}", pos);
                                 &body_bytes[pos..]
                             } else {
+                                debug!("No TagIO magic found in body, using entire body");
                                 &body_bytes
                             }
                         } else {
+                            debug!("Using entire body as TagIO data");
                             &body_bytes
                         };
                         
                         // Convert back to owned Vec<u8>
                         let actual_body = actual_body.to_vec();
+                        info!("Processing TagIO protocol message of {} bytes", actual_body.len());
                         
                         match handle_tagio_over_http(actual_body).await {
                             Ok(response) => Ok::<_, hyper::http::Error>(response),
