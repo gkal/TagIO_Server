@@ -33,7 +33,7 @@ fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fer
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "{} {} [{}] {}",
+                "{} [T] {} [{}] {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 record.level(),
                 record.target(),
@@ -72,6 +72,27 @@ fn hex_dump(bytes: &[u8], max_len: usize) -> String {
     }
 }
 
+/// Extract TagIO protocol data from HTTP headers and body
+fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool {
+    // Check for TagIO protocol indicators in headers
+    let has_tagio_header = headers.get("X-TagIO-Protocol").is_some();
+    let has_tagio_upgrade = headers.get("Upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("TagIO"))
+        .unwrap_or(false);
+    let has_tagio_content = headers.get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/tagio"))
+        .unwrap_or(false);
+    
+    // Check for TagIO magic in body
+    let has_tagio_magic = body.len() >= PROTOCOL_MAGIC.len() && 
+                          &body[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC;
+    
+    // Return true if any of the TagIO indicators are present
+    has_tagio_header || has_tagio_upgrade || has_tagio_content || has_tagio_magic
+}
+
 /// Handles HTTP POST requests containing TagIO protocol messages
 async fn handle_tagio_over_http(body_bytes: Vec<u8>) -> Result<Response<Body>, hyper::http::Error> {
     if body_bytes.is_empty() {
@@ -104,9 +125,12 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>) -> Result<Response<Body>, h
     debug!("Sending TagIO response with {} bytes", body_bytes.len());
     debug!("Response hex dump: {}", hex_dump(&body_bytes, 64));
 
+    // IMPORTANT: Return raw bytes for TagIO protocol without HTTP wrapping
+    // This allows clients expecting raw TagIO protocol to work correctly
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
+        .header("X-TagIO-Raw-Protocol", "true")
         .body(Body::from(body_bytes))
         .unwrap())
 }
@@ -198,6 +222,27 @@ Protocol: TagIO over HTTP tunneling
         .unwrap())
 }
 
+// Helper function to find a subsequence in a byte array
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    
+    'outer: for i in 0..=haystack.len() - needle.len() {
+        for (j, &b) in needle.iter().enumerate() {
+            if haystack[i + j] != b {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
@@ -216,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("===== STARTING TAGIO HTTP TUNNEL SERVER =====");
+    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER =====");
     info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
     
     // Check for PORT environment variable (for cloud platforms like Render)
@@ -264,9 +309,14 @@ async fn main() -> anyhow::Result<()> {
                         debug!("Request headers: {:?}", req.headers());
                     }
                     
+                    // Check for TagIO protocol indicators in headers
+                    let headers = req.headers().clone();
+                    let is_http_upgrade_to_tagio = extract_tagio_from_http(&headers, &[]);
+                    
                     // Special case for GET requests to root or status
                     if req.method() == hyper::Method::GET && 
-                       (req.uri().path() == "/" || req.uri().path() == "/status") {
+                       (req.uri().path() == "/" || req.uri().path() == "/status") && 
+                       !is_http_upgrade_to_tagio {
                         debug!("Serving status page");
                         match serve_status_page().await {
                             Ok(response) => return Ok::<_, hyper::http::Error>(response),
@@ -294,14 +344,34 @@ async fn main() -> anyhow::Result<()> {
                     
                     debug!("Received request body of {} bytes", body_bytes.len());
                     
-                    // Check if this is a TagIO protocol message
-                    let is_tagio = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
+                    // Look for TagIO protocol markers in headers or body
+                    let is_tagio_magic = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
                                    body_bytes.starts_with(PROTOCOL_MAGIC);
+                    
+                    let is_tagio = is_tagio_magic || is_http_upgrade_to_tagio || 
+                                   extract_tagio_from_http(&headers, &body_bytes);
                     
                     if is_tagio {
                         debug!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
                         info!("Processing TagIO protocol message");
-                        match handle_tagio_over_http(body_bytes).await {
+                        
+                        // Skip HTTP headers if they exist, find the TagIO protocol data
+                        let actual_body = if !is_tagio_magic && body_bytes.len() > 5 {
+                            // Try to find TAGIO marker in the body
+                            if let Some(pos) = find_subsequence(&body_bytes, PROTOCOL_MAGIC) {
+                                debug!("Found TagIO magic at position {}", pos);
+                                &body_bytes[pos..]
+                            } else {
+                                &body_bytes
+                            }
+                        } else {
+                            &body_bytes
+                        };
+                        
+                        // Convert back to owned Vec<u8>
+                        let actual_body = actual_body.to_vec();
+                        
+                        match handle_tagio_over_http(actual_body).await {
                             Ok(response) => Ok::<_, hyper::http::Error>(response),
                             Err(e) => {
                                 error!("Error handling TagIO request: {}", e);
@@ -335,8 +405,8 @@ async fn main() -> anyhow::Result<()> {
         .serve(make_svc);
     
     info!("HTTP tunneling server listening on {}", bind_addr);
-    println!("HTTP tunneling server listening on {}", bind_addr);
-    println!("Clients should POST TagIO protocol messages to any endpoint");
+    println!("[T] HTTP tunneling server listening on {}", bind_addr);
+    println!("[T] Clients should POST TagIO protocol messages to any endpoint");
     
     // Run the server
     if let Err(e) = server.await {
