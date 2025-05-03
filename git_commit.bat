@@ -1,8 +1,7 @@
-@echo off
-
 git status
 git add .
 
+@echo off
 :: Use %* to capture the entire command line
 set "commit_msg=%*"
 
