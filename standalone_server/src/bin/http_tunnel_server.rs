@@ -556,40 +556,40 @@ fn find_tagio_magic(data: &[u8]) -> Option<usize> {
 /// Handle an incoming HTTP request, determining if it's a TagIO protocol message
 async fn handle_http_request(req: Request<Body>, debug_mode: bool) -> Result<Response<Body>, hyper::http::Error> {
     // Extract client information
-                    let host = req.headers().get("host")
-                        .map(|h| h.to_str().unwrap_or("unknown"))
-                        .unwrap_or("unknown")
-                        .to_string();
-                    
-                    // Check for WebSocket upgrade request
-                    if hyper_tungstenite::is_upgrade_request(&req) {
-                        info!("Detected WebSocket upgrade request from {}", host);
-                        
+    let host = req.headers().get("host")
+        .map(|h| h.to_str().unwrap_or("unknown"))
+        .unwrap_or("unknown")
+        .to_string();
+    
+    // Check for WebSocket upgrade request
+    if hyper_tungstenite::is_upgrade_request(&req) {
+        info!("Detected WebSocket upgrade request from {}", host);
+        
         // Extract client IP from headers and save it before moving req
-                        let client_ip = req.headers().get("x-forwarded-for")
-                            .and_then(|h| h.to_str().ok())
-                            .or_else(|| req.headers().get("x-real-ip")
-                                .and_then(|h| h.to_str().ok()))
-                            .map(|ip| {
-                                // Take the first IP if there are multiple in X-Forwarded-For
-                                if let Some(pos) = ip.find(',') {
-                                    ip[0..pos].trim()
-                                } else {
-                                    ip.trim()
-                                }
-                            });
-                            
+        let client_ip = req.headers().get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| req.headers().get("x-real-ip")
+                .and_then(|h| h.to_str().ok()))
+            .map(|ip| {
+                // Take the first IP if there are multiple in X-Forwarded-For
+                if let Some(pos) = ip.find(',') {
+                    ip[0..pos].trim()
+                } else {
+                    ip.trim()
+                }
+            });
+        
         // Store the client_ip as an owned String for later use
         let client_ip_str = client_ip.unwrap_or("unknown").to_string();
         info!("WebSocket client connecting from IP: {}", client_ip_str);
-                        
-                        // Convert IP string to a SocketAddr for passing to the handler
-                        let peer_addr = client_ip.and_then(|ip| {
-                            ip.parse::<std::net::IpAddr>().ok().map(|addr| {
-                                SocketAddr::new(addr, 0) // Port isn't important for logging
-                            })
-                        });
-                        
+        
+        // Convert IP string to a SocketAddr for passing to the handler
+        let peer_addr = client_ip.and_then(|ip| {
+            ip.parse::<std::net::IpAddr>().ok().map(|addr| {
+                SocketAddr::new(addr, 0) // Port isn't important for logging
+            })
+        });
+        
         // Store headers for debugging if needed
         let headers_debug_str = if debug_mode {
             format!("{:#?}", req.headers())
@@ -601,8 +601,8 @@ async fn handle_http_request(req: Request<Body>, debug_mode: bool) -> Result<Res
         let upgrade_result = hyper_tungstenite::upgrade(req, None);
         
         match upgrade_result {
-            Ok((mut response, websocket)) => {
-                // Generate a unique TagIO ID for immediate inclusion in the response
+            Ok((response, websocket)) => {
+                // Generate a unique TagIO ID for immediate use
                 let tagio_id = generate_unique_tagio_id().await;
                 info!("Generated TagIO ID {} for WebSocket client {}", tagio_id, client_ip_str);
                 
@@ -610,29 +610,25 @@ async fn handle_http_request(req: Request<Body>, debug_mode: bool) -> Result<Res
                 let ack_message = create_tagio_ack_response(tagio_id);
                 
                 // Log the ACK message for debugging
-                info!("ACK message to include in handshake - {} bytes", ack_message.len());
+                info!("ACK message prepared for immediate sending after handshake - {} bytes", ack_message.len());
                 info!("ACK message hex dump: {}", hex_dump(&ack_message, ack_message.len()));
                 let bytes_str: Vec<String> = ack_message.iter().map(|b| format!("{:02X}", b)).collect();
                 info!("ACK message bytes: [{}]", bytes_str.join(", "));
                 
-                // Include the TagIO ACK message in the WebSocket handshake response
-                // by appending it to the response body
-                let body = hyper::Body::from(ack_message.clone());
-                *response.body_mut() = body;
-                
-                info!("Embedding ACK message in WebSocket handshake response for client {}", client_ip_str);
-                info!("CRITICAL: TagIO ACK message is included in handshake response, not as a separate frame");
-                info!("Client should extract TagIO ID {} from WebSocket handshake response body", tagio_id);
+                // IMPORTANT: Will send the TagIO ACK as the FIRST message immediately after handshake
+                info!("CRITICAL: Will send TagIO ACK message as first frame IMMEDIATELY after handshake completes");
+                info!("Client should wait for the first binary frame containing TagIO ID {}", tagio_id);
                 
                 // Spawn a new task to handle the WebSocket connection
                 let peer_addr_clone = peer_addr;
                 let tagio_id_clone = tagio_id;
+                let ack_message_clone = ack_message;
                 tokio::spawn(async move {
                     match websocket.await {
                         Ok(ws_stream) => {
-                            info!("WebSocket connection established");
-                            // Pass the already assigned TagIO ID to the handler
-                            if let Err(e) = handle_websocket_client_registration(ws_stream, peer_addr_clone, Some(tagio_id_clone)).await {
+                            info!("WebSocket connection established, sending immediate ACK with TagIO ID {}", tagio_id_clone);
+                            // Handle the WebSocket connection with immediate ACK message
+                            if let Err(e) = handle_websocket_with_immediate_ack(ws_stream, peer_addr_clone, tagio_id_clone, ack_message_clone).await {
                                 error!("Error in WebSocket connection: {}", e);
                             }
                         },
@@ -657,149 +653,149 @@ async fn handle_http_request(req: Request<Body>, debug_mode: bool) -> Result<Res
                     .unwrap());
             }
         }
-                    }
-                    
-                    // Check Render-specific headers for SSL termination info
-                    let x_forwarded_proto = req.headers().get("x-forwarded-proto")
-                        .map(|h| h.to_str().unwrap_or("unknown"))
-                        .unwrap_or("unknown");
-                    let is_https = x_forwarded_proto == "https";
-                    
-                    if debug_mode {
-                        debug!("X-Forwarded-Proto: {}, Is HTTPS: {}", x_forwarded_proto, is_https);
-                        debug!("All request headers: {:?}", req.headers());
-                    }
-                    
+    }
+    
+    // Check Render-specific headers for SSL termination info
+    let x_forwarded_proto = req.headers().get("x-forwarded-proto")
+        .map(|h| h.to_str().unwrap_or("unknown"))
+        .unwrap_or("unknown");
+    let is_https = x_forwarded_proto == "https";
+    
+    if debug_mode {
+        debug!("X-Forwarded-Proto: {}, Is HTTPS: {}", x_forwarded_proto, is_https);
+        debug!("All request headers: {:?}", req.headers());
+    }
+    
     // Log proxy headers
-                    info!("Proxy headers - X-Forwarded-Proto: {}, X-Forwarded-For: {:?}, X-Real-IP: {:?}",
-                        x_forwarded_proto,
-                        req.headers().get("x-forwarded-for"),
-                        req.headers().get("x-real-ip"));
-                    
+    info!("Proxy headers - X-Forwarded-Proto: {}, X-Forwarded-For: {:?}, X-Real-IP: {:?}",
+        x_forwarded_proto,
+        req.headers().get("x-forwarded-for"),
+        req.headers().get("x-real-ip"));
+    
     // Enhanced debug logging
-                    if debug_mode {
-                        info!("Full request details for debugging:");
-                        info!("  Method: {}", req.method());
-                        info!("  Path: {}", req.uri().path());
-                        info!("  Query: {:?}", req.uri().query());
-                        info!("  Version: {:?}", req.version());
-                        info!("  Headers:");
-                        for (name, value) in req.headers() {
-                            if let Ok(value_str) = value.to_str() {
-                                info!("    {}: {}", name, value_str);
-                            } else {
-                                info!("    {}: <binary value>", name);
-                            }
-                        }
-                    }
-                    
-                    // Check headers for TagIO protocol indicators
-                    let headers = req.headers().clone();
-                    let is_http_upgrade_to_tagio = extract_tagio_from_http(&headers, &[]);
-                    
-                    // Special case for GET requests to root or status
-                    if req.method() == hyper::Method::GET && 
-                       (req.uri().path() == "/" || req.uri().path() == "/status") {
-                        debug!("Serving status page");
+    if debug_mode {
+        info!("Full request details for debugging:");
+        info!("  Method: {}", req.method());
+        info!("  Path: {}", req.uri().path());
+        info!("  Query: {:?}", req.uri().query());
+        info!("  Version: {:?}", req.version());
+        info!("  Headers:");
+        for (name, value) in req.headers() {
+            if let Ok(value_str) = value.to_str() {
+                info!("    {}: {}", name, value_str);
+            } else {
+                info!("    {}: <binary value>", name);
+            }
+        }
+    }
+    
+    // Check headers for TagIO protocol indicators
+    let headers = req.headers().clone();
+    let is_http_upgrade_to_tagio = extract_tagio_from_http(&headers, &[]);
+    
+    // Special case for GET requests to root or status
+    if req.method() == hyper::Method::GET && 
+       (req.uri().path() == "/" || req.uri().path() == "/status") {
+        debug!("Serving status page");
         return match serve_status_page().await {
             Ok(response) => Ok(response),
-                            Err(e) => {
-                                error!("Error serving status page: {}", e);
+            Err(e) => {
+                error!("Error serving status page: {}", e);
                 Ok(Response::builder()
-                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                    .body(Body::from("Internal server error"))
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Internal server error"))
                     .unwrap())
-                            }
+            }
         };
-                    }
+    }
 
-                    // Get the request body directly
-                    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
-                        Ok(bytes) => {
-                            let bytes_vec = bytes.to_vec();
-                            info!("Received request body of {} bytes", bytes_vec.len());
-                            if !bytes_vec.is_empty() && bytes_vec.len() < 100 {
-                                info!("Request body hex dump: {}", hex_dump(&bytes_vec, bytes_vec.len()));
-                            } else if !bytes_vec.is_empty() {
-                                info!("Request body preview: {}", hex_dump(&bytes_vec, 50));
-                            }
-                            bytes_vec
-                        },
-                        Err(e) => {
-                            error!("Failed to read request body: {}", e);
+    // Get the request body directly
+    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(bytes) => {
+            let bytes_vec = bytes.to_vec();
+            info!("Received request body of {} bytes", bytes_vec.len());
+            if !bytes_vec.is_empty() && bytes_vec.len() < 100 {
+                info!("Request body hex dump: {}", hex_dump(&bytes_vec, bytes_vec.len()));
+            } else if !bytes_vec.is_empty() {
+                info!("Request body preview: {}", hex_dump(&bytes_vec, 50));
+            }
+            bytes_vec
+        },
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
             return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Body::from(format!("Failed to read request body: {}", e)))
-                                .unwrap());
-                        }
-                    };
-                    
-                    // Look for TagIO protocol markers in headers or body
-                    let is_tagio_magic = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
-                                   body_bytes.starts_with(PROTOCOL_MAGIC);
-                    
-                    // Always check the entire body for the magic bytes
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+    
+    // Look for TagIO protocol markers in headers or body
+    let is_tagio_magic = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
+           body_bytes.starts_with(PROTOCOL_MAGIC);
+    
+    // Always check the entire body for the magic bytes
     let has_tagio_magic_anywhere = if !is_tagio_magic {
         match find_tagio_magic(&body_bytes) {
-                            Some(pos) => {
-                                info!("Found TagIO magic at position {}", pos);
-                                true
-                            },
-                            None => false
-                        }
-                    } else {
+            Some(pos) => {
+                info!("Found TagIO magic at position {}", pos);
+                true
+            },
+            None => false
+        }
+    } else {
         true
-                    };
-                    
-                    let is_tagio = is_tagio_magic || is_http_upgrade_to_tagio || 
-                                   extract_tagio_from_http(&headers, &body_bytes) ||
-                                   has_tagio_magic_anywhere;
-                    
-                    if is_tagio {
-                        info!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
-                        
-                        // Skip HTTP headers if they exist, find the TagIO protocol data
-                        let actual_body = if !is_tagio_magic && body_bytes.len() > 5 {
-                            // Try to find TAGIO marker in the body
+    };
+    
+    let is_tagio = is_tagio_magic || is_http_upgrade_to_tagio || 
+           extract_tagio_from_http(&headers, &body_bytes) ||
+           has_tagio_magic_anywhere;
+    
+    if is_tagio {
+        info!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
+        
+        // Skip HTTP headers if they exist, find the TagIO protocol data
+        let actual_body = if !is_tagio_magic && body_bytes.len() > 5 {
+            // Try to find TAGIO marker in the body
             if let Some(pos) = find_tagio_magic(&body_bytes) {
-                                debug!("Using TagIO data starting at position {}", pos);
-                                &body_bytes[pos..]
-                            } else {
-                                debug!("No TagIO magic found in body, using entire body");
-                                &body_bytes
-                            }
-                        } else {
-                            &body_bytes
-                        };
-                        
-                        info!("Processing TagIO protocol message of {} bytes", actual_body.len());
-                        
-                        // Collect actual_body bytes into a new Vec for passing ownership
-                        let actual_body_owned = actual_body.to_vec();
-                        
-                        match handle_tagio_over_http(actual_body_owned, Some(&headers)).await {
-                            Ok(response) => {
-                                return Ok(response);
-                            },
-                            Err(e) => {
-                                error!("Error handling TagIO over HTTP: {}", e);
+                debug!("Using TagIO data starting at position {}", pos);
+                &body_bytes[pos..]
+            } else {
+                debug!("No TagIO magic found in body, using entire body");
+                &body_bytes
+            }
+        } else {
+            &body_bytes
+        };
+        
+        info!("Processing TagIO protocol message of {} bytes", actual_body.len());
+        
+        // Collect actual_body bytes into a new Vec for passing ownership
+        let actual_body_owned = actual_body.to_vec();
+        
+        match handle_tagio_over_http(actual_body_owned, Some(&headers)).await {
+            Ok(response) => {
+                return Ok(response);
+            },
+            Err(e) => {
+                error!("Error handling TagIO over HTTP: {}", e);
                 return Ok(Response::builder()
-                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                    .body(Body::from(format!("Error handling TagIO over HTTP: {}", e)))
-                                    .unwrap());
-                            }
-                        }
-                    } else {
-                        debug!("No TagIO protocol data found in the request");
-                        info!("Non-TagIO request received, responding with echo");
-                        
-                        // Return a simple response for testing
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!("Error handling TagIO over HTTP: {}", e)))
+                    .unwrap());
+            }
+        }
+    } else {
+        debug!("No TagIO protocol data found in the request");
+        info!("Non-TagIO request received, responding with echo");
+        
+        // Return a simple response for testing
         Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "text/plain")
-                            .body(Body::from("This is a TagIO HTTP tunnel server. Send TagIO protocol messages in the body of POST requests."))
-                            .unwrap())
-                    }
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .body(Body::from("This is a TagIO HTTP tunnel server. Send TagIO protocol messages in the body of POST requests."))
+            .unwrap())
+    }
 }
 
 /// Handle binary WebSocket messages
@@ -978,6 +974,7 @@ async fn handle_ws_text_message(
 }
 
 /// Handle WebSocket client registration and message exchange
+#[allow(dead_code)]
 async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>, peer_addr: Option<SocketAddr>, tagio_id: Option<u32>) -> Result<(), anyhow::Error> {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
@@ -1026,6 +1023,125 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
         } else {
             info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
         }
+    }
+    
+    // Wait for client messages
+    while let Some(msg_result) = ws_receiver.next().await {
+        let msg = match msg_result {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Error receiving WebSocket message from {}: {}", client_ip, e);
+                error!("WebSocket connection error details: {:#?}", e);
+                break;
+            }
+        };
+        
+        // Handle different types of WebSocket messages
+        let continue_loop = match msg {
+            WsMessage::Binary(data) => {
+                // Log the received binary data for debugging
+                info!("Received binary WebSocket data: {} bytes", data.len());
+                if data.len() >= 5 {
+                    info!("First 5 bytes: {:02X} {:02X} {:02X} {:02X} {:02X}", 
+                          data.get(0).unwrap_or(&0), 
+                          data.get(1).unwrap_or(&0),
+                          data.get(2).unwrap_or(&0),
+                          data.get(3).unwrap_or(&0),
+                          data.get(4).unwrap_or(&0));
+                }
+                
+                if let Err(e) = handle_ws_binary_message(data, tagio_id, &client_ip, &mut ws_sender).await {
+                    error!("Error handling binary message: {}", e);
+                    false
+                } else {
+                    true
+                }
+            },
+            WsMessage::Text(text) => {
+                if let Err(e) = handle_ws_text_message(text, tagio_id, &client_ip, &mut ws_sender).await {
+                    error!("Error handling text message: {}", e);
+                    false
+                } else {
+                    true
+                }
+            },
+            WsMessage::Ping(data) => {
+                // Respond to ping with pong
+                info!("Received WebSocket ping from {}, sending pong", client_ip);
+                if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
+                    error!("Error sending WebSocket pong to {}: {}", client_ip, e);
+                    false
+                } else {
+                    true
+                }
+            },
+            WsMessage::Pong(_) => {
+                // Just log pongs
+                debug!("Received WebSocket pong from {}", client_ip);
+                true
+            },
+            WsMessage::Close(_) => {
+                info!("Received WebSocket close frame from {}", client_ip);
+                false
+            },
+            _ => {
+                // Unknown message type
+                debug!("Received unknown WebSocket message type from {}", client_ip);
+                true
+            }
+        };
+        
+        if !continue_loop {
+            break;
+        }
+        
+        // Update client's last seen timestamp after each message
+        update_client_timestamp(tagio_id).await;
+    }
+    
+    // Remove client from registry when WebSocket closes
+    let mut registry = CLIENT_REGISTRY.write().await;
+    if let Some(_client) = registry.values().find(|c| c.tagio_id == tagio_id) {
+        info!("WebSocket connection closed for client {} with IP {}, removing from registry", tagio_id, client_ip);
+        registry.retain(|_, c| c.tagio_id != tagio_id);
+    }
+    
+    info!("WebSocket connection closed for {}", client_ip);
+    Ok(())
+}
+
+/// Handle WebSocket client registration and message exchange with immediate ACK
+async fn handle_websocket_with_immediate_ack(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>, peer_addr: Option<SocketAddr>, tagio_id: u32, ack_message: Vec<u8>) -> Result<(), anyhow::Error> {
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    // Get a client IP string that we can use throughout the function
+    let client_ip = peer_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    info!("Handling WebSocket connection for TagIO client with immediate ACK");
+    
+    // Register this client
+    register_client(tagio_id, client_ip.clone()).await;
+    
+    info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
+    
+    // Send an initial ACK response immediately upon connection to reduce latency
+    info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
+    info!("ACK response hex dump: {}", hex_dump(&ack_message, ack_message.len()));
+    info!("ACK response contents: {} bytes: {:?}", ack_message.len(), ack_message);
+    
+    // Log each byte for debugging
+    let bytes_str: Vec<String> = ack_message.iter().map(|b| format!("{:02X}", b)).collect();
+    info!("ACK response bytes: [{}]", bytes_str.join(", "));
+    
+    // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
+    // Send the response via WebSocket, wrapped in a binary frame
+    if let Err(e) = ws_sender.send(WsMessage::Binary(ack_message.clone())).await {
+        error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
+        return Ok(());
+    } else {
+        info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
     }
     
     // Wait for client messages
