@@ -601,24 +601,49 @@ async fn handle_http_request(req: Request<Body>, debug_mode: bool) -> Result<Res
         let upgrade_result = hyper_tungstenite::upgrade(req, None);
         
         match upgrade_result {
-            Ok((response, websocket)) => {
-                        // Spawn a new task to handle the WebSocket connection
-                        tokio::spawn(async move {
-                            match websocket.await {
-                                Ok(ws_stream) => {
-                                    info!("WebSocket connection established");
-                                    if let Err(e) = handle_websocket_client_registration(ws_stream, peer_addr).await {
-                                        error!("Error in WebSocket connection: {}", e);
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Error upgrading WebSocket connection: {}", e);
-                                }
+            Ok((mut response, websocket)) => {
+                // Generate a unique TagIO ID for immediate inclusion in the response
+                let tagio_id = generate_unique_tagio_id().await;
+                info!("Generated TagIO ID {} for WebSocket client {}", tagio_id, client_ip_str);
+                
+                // Create ACK response with the TagIO ID
+                let ack_message = create_tagio_ack_response(tagio_id);
+                
+                // Log the ACK message for debugging
+                info!("ACK message to include in handshake - {} bytes", ack_message.len());
+                info!("ACK message hex dump: {}", hex_dump(&ack_message, ack_message.len()));
+                let bytes_str: Vec<String> = ack_message.iter().map(|b| format!("{:02X}", b)).collect();
+                info!("ACK message bytes: [{}]", bytes_str.join(", "));
+                
+                // Include the TagIO ACK message in the WebSocket handshake response
+                // by appending it to the response body
+                let body = hyper::Body::from(ack_message.clone());
+                *response.body_mut() = body;
+                
+                info!("Embedding ACK message in WebSocket handshake response for client {}", client_ip_str);
+                info!("CRITICAL: TagIO ACK message is included in handshake response, not as a separate frame");
+                info!("Client should extract TagIO ID {} from WebSocket handshake response body", tagio_id);
+                
+                // Spawn a new task to handle the WebSocket connection
+                let peer_addr_clone = peer_addr;
+                let tagio_id_clone = tagio_id;
+                tokio::spawn(async move {
+                    match websocket.await {
+                        Ok(ws_stream) => {
+                            info!("WebSocket connection established");
+                            // Pass the already assigned TagIO ID to the handler
+                            if let Err(e) = handle_websocket_client_registration(ws_stream, peer_addr_clone, Some(tagio_id_clone)).await {
+                                error!("Error in WebSocket connection: {}", e);
                             }
-                        });
-                        
-                        // Return the response to complete the WebSocket handshake
-                        return Ok(response);
+                        },
+                        Err(e) => {
+                            error!("Error upgrading WebSocket connection: {}", e);
+                        }
+                    }
+                });
+                
+                // Return the response to complete the WebSocket handshake
+                return Ok(response);
             },
             Err(e) => {
                 error!("Failed to upgrade WebSocket connection from {}: {}", client_ip_str, e);
@@ -953,13 +978,19 @@ async fn handle_ws_text_message(
 }
 
 /// Handle WebSocket client registration and message exchange
-async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>, peer_addr: Option<SocketAddr>) -> Result<(), anyhow::Error> {
+async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>, peer_addr: Option<SocketAddr>, tagio_id: Option<u32>) -> Result<(), anyhow::Error> {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
     info!("Handling WebSocket connection for TagIO client");
     
+    // Track if the TagIO ID was provided from the handshake
+    let tagio_id_was_provided = tagio_id.is_some();
+
     // Generate a unique TagIO ID for this client
-    let tagio_id = generate_unique_tagio_id().await;
+    let tagio_id = match tagio_id {
+        Some(id) => id,
+        None => generate_unique_tagio_id().await
+    };
     let client_ip = match peer_addr {
         Some(addr) => addr.ip().to_string(),
         None => "unknown".to_string()
@@ -972,24 +1003,29 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
     
     info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
     
-    // Send an initial ACK response immediately upon connection to reduce latency
-    let response = create_tagio_ack_response(tagio_id);
-    
-    info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-    info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-    info!("ACK response contents: {} bytes: {:?}", response.len(), response);
-
-    // Log each byte for debugging
-    let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-    info!("ACK response bytes: [{}]", bytes_str.join(", "));
-
-    // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
-    // Send the response via WebSocket, wrapped in a binary frame
-    if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
-        error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
-        return Ok(());
+    // Only send an initial ACK response if it wasn't already included in the handshake
+    if tagio_id_was_provided {
+        info!("TagIO ID {} was already sent in handshake response, skipping initial ACK", tagio_id);
     } else {
-        info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        // Send an initial ACK response immediately upon connection to reduce latency
+        let response = create_tagio_ack_response(tagio_id);
+        
+        info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
+        info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
+        info!("ACK response contents: {} bytes: {:?}", response.len(), response);
+        
+        // Log each byte for debugging
+        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+        info!("ACK response bytes: [{}]", bytes_str.join(", "));
+        
+        // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
+        // Send the response via WebSocket, wrapped in a binary frame
+        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
+            error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
+            return Ok(());
+        } else {
+            info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        }
     }
     
     // Wait for client messages

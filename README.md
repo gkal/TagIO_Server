@@ -4,15 +4,15 @@
 
 The TagIO HTTP Tunnel Server provides both HTTP tunneling and WebSocket capabilities for TagIO protocol clients, facilitating communication between clients behind firewalls or NAT devices. This server acts as a bridge for the TagIO protocol (a custom binary protocol for efficient device communication).
 
-## Current Version: 0.3.1
+## Current Version: 0.3.2
 
 Recent enhancements:
-- Improved code organization and reduced complexity through refactoring
-- Enhanced WebSocket handling with better error management
-- Added helper functions to reduce code duplication
-- Fixed naming conflicts in the build process
-- Streamlined status page HTML
-- Updated log format for better readability
+- Fixed ACK message format to ensure correct binary structure
+- Added REGL/REGLACK protocol for client ID confirmation
+- Implemented error handling with REGLERR responses
+- Updated to big-endian format for all numeric identifiers
+- Added detailed binary protocol documentation with WebSocket framing
+- Improved debug logging for binary message tracing
 
 ## Project Structure
 
@@ -97,58 +97,63 @@ The TagIO protocol uses:
 
 The server automatically assigns TagIO IDs in the range 5000-9999 to connected clients.
 
-### Protocol Message Formats
+### WebSocket Framing
 
-1. **ACK Response** (server → client):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "ACK" + [Client ID: 4 bytes, big-endian]
-   ```
-   Example: `54 41 47 49 4F 00 00 00 01 41 43 4B 00 00 19 FB` (ID: 6651)
+When sent over WebSockets, TagIO messages are wrapped in WebSocket binary frames:
 
-2. **PING Message** (client → server):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "PING"
-   ```
-   Example: `54 41 47 49 4F 00 00 00 01 50 49 4E 47`
+#### Example ACK Message with WebSocket Frame
+0x82 0x10: WebSocket binary frame header (indicates binary data, 16 bytes)
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+41 43 4B: "ACK" Message type
+00 00 18 4B: TagIO ID 6219 in big-endian format
 
-3. **REGL Message** (client → server):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "REGL" + "REGISTER:<assigned_id>"
-   ```
-   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 52 45 47 49 53 54 45 52 3A 37 38 39 30`
+### Protocol Message Types
 
-4. **REGLACK Message** (server → client):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "REGLACK"
-   ```
-   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 41 43 4B`
+1. **PING** (Client to Server)
+0x82 0x0D: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+50 49 4E 47: "PING" Message type
 
-5. **REGLERR Message** (server → client on error):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "REGLERR" + [Error message]
-   ```
-   Error types: `ID_MISMATCH`, `INVALID_ID`, `MISSING_ID`, `MISSING_REGISTER`, `INVALID_FORMAT`
-   
-   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 45 52 52 49 44 5F 4D 49 53 4D 41 54 43 48` (ID_MISMATCH)
+2. **ACK** (Server to Client)
+0x82 0x10: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+41 43 4B: "ACK" Message type
+XX XX XX XX: TagIO ID in big-endian format
 
-6. **MSG Message** (bidirectional):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "MSG" + [Target ID: 4 bytes, big-endian] + [Payload]
-   ```
+3. **REGL** (Client to Server)
+0x82 0xXX: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+52 45 47 4C: "REGL" Message type
+52 45 47 49 53 54 45 52 3A XXXX: "REGISTER:XXXX" (ID as string)
 
-7. **REGISTER Message** (client → server):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "REGISTER" + [Client ID: 4 bytes, big-endian]
-   ```
+4. **REGLACK** (Server to Client)
+0x82 0x10: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+52 45 47 4C 41 43 4B: "REGLACK" Message type
 
-8. **REG_ACK Message** (server → client):
-   ```
-   TAGIO + [Version: 00 00 00 01] + "REG_ACK"
-   ```
+5. **REGLERR** (Server to Client on Error)
+0x82 0xXX: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+52 45 47 4C 45 52 52: "REGLERR" Message type
+XX XX...: Error message as ASCII bytes (Examples: ID_MISMATCH, INVALID_ID, MISSING_ID)
+
+6. **MSG** (Bidirectional)
+0x82 0xXX: WebSocket frame header
+54 41 47 49 4F: "TAGIO" Magic bytes
+00 00 00 01: Protocol version
+4D 53 47: "MSG" Message type
+XX XX XX XX: Target ID in big-endian format
+XX XX...: Optional payload data
 
 ### Endianness Note
 
-**IMPORTANT:** As of version 0.3.1, all numeric identifiers in the TagIO protocol are encoded in **big-endian** format. Previous versions used little-endian encoding, which could cause data corruption when clients and servers had different expectations.
+**IMPORTANT:** As of version 0.3.2, all numeric identifiers in the TagIO protocol are encoded in **big-endian** format. Previous versions used little-endian encoding, which could cause data corruption when clients and servers had different expectations.
 
 ## WebSocket Implementation
 
