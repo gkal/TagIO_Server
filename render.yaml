@@ -2,19 +2,17 @@ services:
   - type: web
     name: tagio-relay-server
     env: rust
-    buildCommand: cargo build --release --bin http_tunnel_server
-    startCommand: PORT=10000 ./target/release/http_tunnel_server --port 10000
+    buildCommand: cd standalone_server && cargo build --release --bin http_tunnel_server
+    startCommand: ./standalone_server/target/release/http_tunnel_server --log-level info
     region: frankfurt
     plan: starter
-    healthCheckPath: /
+    healthCheckPath: /status
     # The following envVars are used for configuration
     envVars:
       - key: AUTH_TOKEN
         sync: false # Set to false to allow custom values per environment
       - key: RUST_LOG
         value: info
-      - key: PORT
-        value: 10000
       - key: SERVER_NAME
         value: tagio-server.onrender.com
     
@@ -24,13 +22,6 @@ services:
     scaling:
       minInstances: 1
       maxInstances: 1
-    # Increased deployment timeout for slower builds
-    initialDeployHook: echo "Starting TagIO HTTP Tunnel Server deployment"
     # HTTP tunnel server handles its own HTTP requests
-    # No need for TCP proxy configuration
-    tcpPorts:
-      - port: 80
-        name: tagio-http
-        proxy:
-          port: 10000
-          protocol: http 
+    domains:
+      - tagio-server.onrender.com 

@@ -2,11 +2,12 @@ use anyhow;
 use clap::Parser;
 use hyper::{Body, Request, Response, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
-use log::{debug, info, error, LevelFilter};
+use log::{debug, info, error, warn, LevelFilter};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 // Constants for protocol magic
 const PROTOCOL_MAGIC: &[u8] = b"TAGIO";
@@ -55,55 +56,58 @@ fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fer
     Ok(())
 }
 
-/// Handles HTTP POST requests containing TagIO protocol messages
-async fn handle_tagio_over_http(req: Request<Body>) -> Result<Response<Body>, hyper::http::Error> {
-    // Only accept POST requests for TagIO tunneling
-    if req.method() != hyper::Method::POST {
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(Body::from("Only POST method is allowed for TagIO protocol tunneling"))
-            .unwrap());
-    }
-
-    // Get the request body
-    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("Failed to read request body: {}", e)))
-                .unwrap());
-        }
-    };
+/// Helper function to format bytes as a hex dump for logging
+fn hex_dump(bytes: &[u8], max_len: usize) -> String {
+    let preview_len = std::cmp::min(bytes.len(), max_len);
+    let preview: Vec<String> = bytes.iter()
+        .take(preview_len)
+        .map(|b| format!("{:02X}", b))
+        .collect();
     
+    let preview_str = preview.join(" ");
+    if bytes.len() > max_len {
+        format!("{} ... ({} more bytes)", preview_str, bytes.len() - max_len)
+    } else {
+        preview_str
+    }
+}
+
+/// Handles HTTP POST requests containing TagIO protocol messages
+async fn handle_tagio_over_http(body_bytes: Vec<u8>) -> Result<Response<Body>, hyper::http::Error> {
     if body_bytes.is_empty() {
+        error!("Received empty request body");
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Empty request body"))
             .unwrap());
     }
 
-    debug!("Received TagIO over HTTP request with {} bytes", body_bytes.len());
+    debug!("Processing TagIO over HTTP with {} bytes", body_bytes.len());
+    debug!("Message hex dump: {}", hex_dump(&body_bytes, 64));
 
-    // Examine the request body for TagIO protocol
-    if body_bytes.len() < PROTOCOL_MAGIC.len() || !body_bytes.starts_with(PROTOCOL_MAGIC) {
-        return Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("Invalid TagIO protocol data"))
-            .unwrap());
+    // Log if we have the magic bytes
+    if body_bytes.len() >= PROTOCOL_MAGIC.len() {
+        let magic_slice = &body_bytes[0..PROTOCOL_MAGIC.len()];
+        if magic_slice == PROTOCOL_MAGIC {
+            info!("Valid TagIO protocol message received (magic: {})", 
+                 String::from_utf8_lossy(magic_slice));
+        } else {
+            warn!("Invalid protocol magic: {}", hex_dump(magic_slice, magic_slice.len()));
+            warn!("Expected magic: {}", hex_dump(PROTOCOL_MAGIC, PROTOCOL_MAGIC.len()));
+        }
+    } else {
+        warn!("Message too short ({} bytes) to contain TagIO protocol magic", body_bytes.len());
     }
 
-    // For now, just echo back the request with an acknowledgment
-    let mut response_bytes = Vec::with_capacity(body_bytes.len() + 32);
-    response_bytes.extend_from_slice(PROTOCOL_MAGIC);
-    response_bytes.extend_from_slice(b"ACKNOWLEDGED");
-    response_bytes.extend_from_slice(&body_bytes);
+    // For TagIO protocol, the content type must be application/octet-stream
+    // and we must return the raw bytes WITHOUT any HTTP headers in the response body
+    debug!("Sending TagIO response with {} bytes", body_bytes.len());
+    debug!("Response hex dump: {}", hex_dump(&body_bytes, 64));
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
-        .body(Body::from(response_bytes))
+        .body(Body::from(body_bytes))
         .unwrap())
 }
 
@@ -162,22 +166,24 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
     
     <pre>
 Server: This domain (same as in your browser address bar)
-Port: 80 (HTTP) or 443 (HTTPS)
+Port: 443 (HTTPS)
 Protocol: TagIO over HTTP tunneling
-    </pre>
+</pre>
     
     <div class="note">
         <h3>Important Note for Client Applications</h3>
-        <p>This server implements TagIO protocol tunneling over HTTP. Client applications must wrap TagIO protocol messages 
-        in HTTP POST requests to the /tagio endpoint.</p>
+        <p>This server implements TagIO protocol tunneling over HTTPS. Client applications must wrap TagIO protocol messages 
+        in HTTP POST requests to any endpoint. The server is accessible only via HTTPS on the standard port 443.</p>
+        <p>You do NOT need to specify any special port in your client configuration.</p>
     </div>
     
     <h2>For Developers</h2>
     <p>TagIO clients should:</p>
     <ol>
-        <li>Connect to this server via HTTP or HTTPS</li>
-        <li>Send TagIO protocol messages in the body of POST requests to /tagio</li>
+        <li>Connect to this server via HTTPS (port 443)</li>
+        <li>Send TagIO protocol messages in the body of POST requests</li>
         <li>Read responses from the HTTP response body</li>
+        <li>Do not attempt to connect directly to internal port 10000</li>
     </ol>
     
     <p>For more information, please refer to the TagIO documentation.</p>
@@ -211,52 +217,117 @@ async fn main() -> anyhow::Result<()> {
     
     // Print banner
     println!("===== STARTING TAGIO HTTP TUNNEL SERVER =====");
-    info!("TagIO HTTP Tunnel Server starting up");
+    info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
+    
+    // Check for PORT environment variable (for cloud platforms like Render)
+    let port = match std::env::var("PORT") {
+        Ok(val) => match val.parse::<u16>() {
+            Ok(port) => {
+                info!("Using PORT environment variable: {}", port);
+                port
+            },
+            Err(_) => {
+                warn!("Invalid PORT environment variable: {}, using command line port: {}", val, args.port);
+                args.port
+            }
+        },
+        Err(_) => args.port,
+    };
     
     // Determine the bind address
     let bind_addr = SocketAddr::new(
         std::net::IpAddr::from_str("0.0.0.0").unwrap(),
-        args.port
+        port
     );
     
+    // Use a boolean flag for debug mode to avoid lifetime issues
+    let debug_enabled = log_level == LevelFilter::Debug || log_level == LevelFilter::Trace;
+    
     // Create the HTTP service
-    let make_svc = make_service_fn(|_conn| async {
-        Ok::<_, Infallible>(service_fn(move |req: Request<Body>| async move {
-            // Route the request based on the path
-            match (req.method(), req.uri().path()) {
-                (&hyper::Method::GET, "/") | (&hyper::Method::GET, "/status") => {
-                    match serve_status_page().await {
-                        Ok(response) => Ok::<_, hyper::http::Error>(response),
-                        Err(e) => {
-                            error!("Error serving status page: {}", e);
-                            Ok::<_, hyper::http::Error>(Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::from("Internal server error"))
-                                .unwrap())
+    let make_svc = make_service_fn(move |_conn| {
+        // Create a clone for moving into the service_fn closure
+        let debug_mode = debug_enabled;
+        
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                // Clone for the async block
+                let debug_mode = debug_mode;
+                
+                async move {
+                    // Log all incoming requests with detailed information
+                    info!("Received HTTP request: {} {} from {:?}", 
+                          req.method(), 
+                          req.uri().path(),
+                          req.headers().get("host").map(|h| h.to_str().unwrap_or("unknown")).unwrap_or("unknown"));
+                    
+                    if debug_mode {
+                        debug!("Request headers: {:?}", req.headers());
+                    }
+                    
+                    // Special case for GET requests to root or status
+                    if req.method() == hyper::Method::GET && 
+                       (req.uri().path() == "/" || req.uri().path() == "/status") {
+                        debug!("Serving status page");
+                        match serve_status_page().await {
+                            Ok(response) => return Ok::<_, hyper::http::Error>(response),
+                            Err(e) => {
+                                error!("Error serving status page: {}", e);
+                                return Ok::<_, hyper::http::Error>(Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(Body::from("Internal server error"))
+                                    .unwrap());
+                            }
                         }
                     }
-                }
-                (_, "/tagio") => {
-                    match handle_tagio_over_http(req).await {
-                        Ok(response) => Ok::<_, hyper::http::Error>(response),
+
+                    // Get the request body directly
+                    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
+                        Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
-                            error!("Error handling TagIO request: {}", e);
-                            Ok::<_, hyper::http::Error>(Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::from("Internal server error"))
-                                .unwrap())
+                            error!("Failed to read request body: {}", e);
+                            return Ok::<_, hyper::http::Error>(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Body::from(format!("Failed to read request body: {}", e)))
+                                .unwrap());
                         }
+                    };
+                    
+                    debug!("Received request body of {} bytes", body_bytes.len());
+                    
+                    // Check if this is a TagIO protocol message
+                    let is_tagio = body_bytes.len() >= PROTOCOL_MAGIC.len() && 
+                                   body_bytes.starts_with(PROTOCOL_MAGIC);
+                    
+                    if is_tagio {
+                        debug!("Found TagIO protocol data in request of {} bytes", body_bytes.len());
+                        info!("Processing TagIO protocol message");
+                        match handle_tagio_over_http(body_bytes).await {
+                            Ok(response) => Ok::<_, hyper::http::Error>(response),
+                            Err(e) => {
+                                error!("Error handling TagIO request: {}", e);
+                                Ok::<_, hyper::http::Error>(Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(Body::from("Internal server error"))
+                                    .unwrap())
+                            }
+                        }
+                    } else {
+                        // If not TagIO data, log the first few bytes for debugging
+                        if !body_bytes.is_empty() {
+                            debug!("Request body bytes: {}", hex_dump(&body_bytes, 64));
+                        }
+                        
+                        // Accept any HTTP request for troubleshooting
+                        info!("Non-TagIO request received, responding with echo");
+                        Ok::<_, hyper::http::Error>(Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/octet-stream")
+                            .body(Body::from(body_bytes))
+                            .unwrap())
                     }
                 }
-                _ => {
-                    // Return 404 for any other path
-                    Ok::<_, hyper::http::Error>(Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::from("Not Found"))
-                        .unwrap())
-                }
-            }
-        }))
+            }))
+        }
     });
     
     // Create the HTTP server
@@ -265,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
     
     info!("HTTP tunneling server listening on {}", bind_addr);
     println!("HTTP tunneling server listening on {}", bind_addr);
-    println!("Clients should POST TagIO protocol messages to /tagio endpoint");
+    println!("Clients should POST TagIO protocol messages to any endpoint");
     
     // Run the server
     if let Err(e) = server.await {
@@ -274,4 +345,4 @@ async fn main() -> anyhow::Result<()> {
     }
     
     Ok(())
-} 
+}
