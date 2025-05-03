@@ -188,15 +188,27 @@ async fn generate_unique_tagio_id() -> u32 {
 
 /// Create a TagIO ACK response message
 fn create_tagio_ack_response(tagio_id: u32) -> Vec<u8> {
+    // Create response with exact allocation for: TAGIO(5) + version(4) + ACK(3) + ID(4)
     let mut response = Vec::with_capacity(16);
+    
     // Add TAGIO magic bytes
-    response.extend_from_slice(PROTOCOL_MAGIC);
+    response.extend_from_slice(PROTOCOL_MAGIC); // 5 bytes: "TAGIO"
+    
     // Use protocol version 1
-    response.extend_from_slice(&[0, 0, 0, 1]);
-    // Add ACK message
-    response.extend_from_slice(b"ACK");
-    // Add TagIO ID in big-endian format instead of little-endian
-    response.extend_from_slice(&tagio_id.to_be_bytes());
+    response.extend_from_slice(&[0, 0, 0, 1]); // 4 bytes: version
+    
+    // Add ACK message - EXACTLY 3 bytes, no null terminator or extra bytes
+    response.extend_from_slice(b"ACK"); // 3 bytes: "ACK"
+    
+    // Add TagIO ID in big-endian format
+    response.extend_from_slice(&tagio_id.to_be_bytes()); // 4 bytes: ID
+    
+    // Verify length is exactly 16 bytes
+    debug_assert_eq!(response.len(), 16, "ACK response must be exactly 16 bytes");
+    
+    // Log response bytes for debugging
+    info!("Created ACK message - 16 bytes: TAGIO + version + ACK + ID({})", tagio_id);
+    
     response
 }
 
@@ -807,6 +819,10 @@ async fn handle_ws_binary_message(
     // Handle REGL message specifically
     if msg_type.contains("REGL") {
         info!("Received REGL message from client {}, handling registration confirmation", client_ip);
+        info!("Raw REGL message: {}", hex_dump(&data, data.len()));
+        
+        // Log the message as text if possible
+        info!("REGL message as text: {}", String::from_utf8_lossy(&data));
         
         // Track if we successfully extracted a valid ID
         let mut id_valid = false;
@@ -814,10 +830,13 @@ async fn handle_ws_binary_message(
         
         // Extract client ID if included in REGISTER message
         if let Some(register_info) = msg_type.find("REGISTER:") {
+            info!("Found REGISTER: marker at position {}", register_info);
             if register_info + 9 < msg_type.len() {
-                match msg_type[register_info + 9..].parse::<u32>() {
+                let id_str = &msg_type[register_info + 9..];
+                info!("Extracted ID string: '{}'", id_str);
+                match id_str.parse::<u32>() {
                     Ok(client_provided_id) => {
-                        info!("Client provided TagIO ID: {}", client_provided_id);
+                        info!("Successfully parsed client provided TagIO ID: {}", client_provided_id);
                         
                         // Verify that the client is using the same ID we assigned
                         if client_provided_id == tagio_id {
@@ -834,12 +853,12 @@ async fn handle_ws_binary_message(
                     },
                     Err(e) => {
                         error_msg = "INVALID_ID";
-                        error!("Failed to parse TagIO ID from REGISTER message: {}", e);
+                        error!("Failed to parse TagIO ID '{}' from REGISTER message: {}", id_str, e);
                     }
                 }
             } else {
                 error_msg = "MISSING_ID";
-                error!("REGISTER message format invalid, missing ID value");
+                error!("REGISTER message format invalid, missing ID value after 'REGISTER:'");
             }
         } else {
             error_msg = "MISSING_REGISTER";
@@ -864,8 +883,12 @@ async fn handle_ws_binary_message(
             error!("Sending REGLERR response to client {}: {}", client_ip, error_msg);
         }
         
+        // Log response for debugging
         info!("Response hex dump: {}", hex_dump(&response, response.len()));
-        
+        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+        info!("Response bytes: [{}]", bytes_str.join(", "));
+        info!("Response as text: {}", String::from_utf8_lossy(&response));
+
         if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
             error!("Error sending registration response to {}: {}", client_ip, e);
             return Err(anyhow::anyhow!("Failed to send registration response: {}", e));
@@ -880,8 +903,14 @@ async fn handle_ws_binary_message(
     
     info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
     info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-    
-    // Send TagIO protocol data wrapped in a WebSocket binary frame
+    info!("ACK response contents: {} bytes: {:?}", response.len(), response);
+
+    // Log each byte for debugging
+    let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+    info!("ACK response bytes: [{}]", bytes_str.join(", "));
+
+    // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
+    // Send the response via WebSocket, wrapped in a binary frame
     if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
         error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
         return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
@@ -948,7 +977,12 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
     
     info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
     info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-    
+    info!("ACK response contents: {} bytes: {:?}", response.len(), response);
+
+    // Log each byte for debugging
+    let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+    info!("ACK response bytes: [{}]", bytes_str.join(", "));
+
     // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
     // Send the response via WebSocket, wrapped in a binary frame
     if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
@@ -1061,8 +1095,10 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("[ T ] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.1 =====");
-    info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
+    println!("[ T ] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.2 =====");
+    println!("[ T ] Build timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    info!("TagIO HTTP Tunnel Server v0.3.2 starting up with log level: {}", args.log_level);
+    info!("Fixed ACK message format and added REGL/REGLACK protocol support");
 
     // Print protocol specification
     print_tagio_protocol_spec();
