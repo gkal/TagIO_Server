@@ -724,12 +724,35 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
     
     info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
     
+    // Send an initial ACK response immediately upon connection to reduce latency
+    let mut response = Vec::with_capacity(16);
+    // Add TAGIO magic bytes
+    response.extend_from_slice(PROTOCOL_MAGIC);
+    // Use protocol version 1
+    response.extend_from_slice(&[0, 0, 0, 1]);
+    // Add ACK message
+    response.extend_from_slice(b"ACK");
+    // Add TagIO ID in little-endian format
+    response.extend_from_slice(&tagio_id.to_le_bytes());
+    
+    info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
+    info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
+    
+    // Send the response via WebSocket
+    if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
+        error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
+        return Ok(());
+    } else {
+        info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+    }
+    
     // Wait for client messages, don't send anything automatically
     while let Some(msg_result) = ws_receiver.next().await {
         let msg = match msg_result {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Error receiving WebSocket message: {}", e);
+                error!("Error receiving WebSocket message from {}: {}", client_ip, e);
+                error!("WebSocket connection error details: {:#?}", e);
                 break;
             }
         };
@@ -764,15 +787,34 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                 }
                 
                 // Continue with regular protocol parsing as needed
-                if data.len() >= PROTOCOL_MAGIC.len() && &data[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC {
+                // Be more lenient with WebSocket messages, attempt to find TagIO magic anywhere in the message
+                let has_tagio_magic = if data.len() >= PROTOCOL_MAGIC.len() {
+                    if &data[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC {
+                        true
+                    } else {
+                        // Try to find TAGIO marker anywhere in the data
+                        find_subsequence(&data, PROTOCOL_MAGIC).is_some()
+                    }
+                } else {
+                    false
+                };
+                
+                if has_tagio_magic {
                     // This is a TagIO protocol message
                     info!("Received TagIO protocol message of {} bytes via WebSocket from {}", data.len(), client_ip);
                     
                     // Extract the message type if possible
-                    let msg_type = if data.len() >= PROTOCOL_MAGIC.len() + 4 + 4 { 
-                        let msg_type_offset = PROTOCOL_MAGIC.len() + 4;
-                        let msg_type_bytes = &data[msg_type_offset..];
-                        String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
+                    let msg_type = if data.len() >= PROTOCOL_MAGIC.len() + 4 + 3 { 
+                        // Find the TAGIO magic position
+                        let magic_pos = find_subsequence(&data, PROTOCOL_MAGIC).unwrap_or(0);
+                        let msg_type_offset = magic_pos + PROTOCOL_MAGIC.len() + 4;
+                        
+                        if msg_type_offset < data.len() {
+                            let msg_type_bytes = &data[msg_type_offset..];
+                            String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
+                        } else {
+                            "UNKNOWN".to_string()
+                        }
                     } else {
                         "UNKNOWN".to_string()
                     };
@@ -941,7 +983,7 @@ async fn main() -> anyhow::Result<()> {
                     if hyper_tungstenite::is_upgrade_request(&req) {
                         info!("Detected WebSocket upgrade request from {}", host);
                         
-                        // Extract client IP from headers
+                        // Extract client IP from headers and save it before moving req
                         let client_ip = req.headers().get("x-forwarded-for")
                             .and_then(|h| h.to_str().ok())
                             .or_else(|| req.headers().get("x-real-ip")
@@ -954,8 +996,10 @@ async fn main() -> anyhow::Result<()> {
                                     ip.trim()
                                 }
                             });
-                            
-                        info!("WebSocket client connecting from IP: {}", client_ip.unwrap_or("unknown"));
+                        
+                        // Store the client_ip as an owned String for later use
+                        let client_ip_str = client_ip.unwrap_or("unknown").to_string();
+                        info!("WebSocket client connecting from IP: {}", client_ip_str);
                         
                         // Convert IP string to a SocketAddr for passing to the handler
                         let peer_addr = client_ip.and_then(|ip| {
@@ -964,35 +1008,48 @@ async fn main() -> anyhow::Result<()> {
                             })
                         });
                         
-                        // Handle the WebSocket connection
-                        let (response, websocket) = match hyper_tungstenite::upgrade(req, None) {
-                            Ok(upgrade) => upgrade,
-                            Err(e) => {
-                                error!("Failed to upgrade WebSocket connection: {}", e);
-                                return Ok::<_, hyper::http::Error>(Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(Body::from("Failed to upgrade to WebSocket"))
-                                    .unwrap());
-                            }
+                        // Store headers for debugging if needed
+                        let headers_debug_str = if debug_mode {
+                            format!("{:#?}", req.headers())
+                        } else {
+                            String::new()
                         };
                         
-                        // Spawn a new task to handle the WebSocket connection
-                        tokio::spawn(async move {
-                            match websocket.await {
-                                Ok(ws_stream) => {
-                                    info!("WebSocket connection established");
-                                    if let Err(e) = handle_websocket_client_registration(ws_stream, peer_addr).await {
-                                        error!("Error in WebSocket connection: {}", e);
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Error upgrading WebSocket connection: {}", e);
-                                }
-                            }
-                        });
+                        // Handle the WebSocket connection
+                        let upgrade_result = hyper_tungstenite::upgrade(req, None);
                         
-                        // Return the response to complete the WebSocket handshake
-                        return Ok(response);
+                        match upgrade_result {
+                            Ok((response, websocket)) => {
+                                // Spawn a new task to handle the WebSocket connection
+                                tokio::spawn(async move {
+                                    match websocket.await {
+                                        Ok(ws_stream) => {
+                                            info!("WebSocket connection established");
+                                            if let Err(e) = handle_websocket_client_registration(ws_stream, peer_addr).await {
+                                                error!("Error in WebSocket connection: {}", e);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("Error upgrading WebSocket connection: {}", e);
+                                        }
+                                    }
+                                });
+                                
+                                // Return the response to complete the WebSocket handshake
+                                return Ok(response);
+                            },
+                            Err(e) => {
+                                error!("Failed to upgrade WebSocket connection from {}: {}", client_ip_str, e);
+                                error!("WebSocket upgrade error details: {:#?}", e);
+                                if debug_mode {
+                                    error!("WebSocket upgrade failed, request headers were: {}", headers_debug_str);
+                                }
+                                return Ok::<_, hyper::http::Error>(Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Body::from(format!("Failed to upgrade to WebSocket: {}", e)))
+                                    .unwrap());
+                            }
+                        }
                     }
                     
                     // Check Render-specific headers for SSL termination info

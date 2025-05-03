@@ -1493,7 +1493,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tagio_http_tunnel"
+name = "tagio_workspace"
 version = "0.2.1"
 
 [[package]]

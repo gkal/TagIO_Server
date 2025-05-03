@@ -9,7 +9,7 @@ members = ["standalone_server"]
 default-members = ["standalone_server"]
 
 [package]
-name = "tagio_http_tunnel"
+name = "tagio_workspace"
 version = "0.2.1"
 edition = "2021"
 authors = ["TagIO Team"]
@@ -17,7 +17,7 @@ description = "TagIO HTTP Tunnel Server - Standalone HTTP tunneling server for T
 
 # This is just a placeholder to satisfy Cargo requirements
 [lib]
-name = "tagio_http_tunnel"
+name = "tagio_workspace_lib"
 path = "src/lib.rs"
 
 [profile.release]
