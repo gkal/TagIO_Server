@@ -11,6 +11,14 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+*.d
+*.ilk
+*.exp
+*.lib
+
+# Windows specific
+*.exe
+*.dll
 
 # Environment config
 .env
@@ -30,6 +38,7 @@ Thumbs.db
 *.iml
 *.swp
 *.swo
+*~
 
 # Deploy folder
 deploy/
@@ -47,3 +56,14 @@ backup_relay_server/
 
 # Binary files used for testing
 test_ping.bin
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# Command artifacts
+*"-u origin main"
+
+# Build artifacts specific to this project
+tagio_relay_server.*
