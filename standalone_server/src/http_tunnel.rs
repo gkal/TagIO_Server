@@ -19,6 +19,7 @@ const ERROR_MESSAGE: u32 = 99;
 // Client information
 #[derive(Clone)]
 pub struct ClientInfo {
+    #[allow(dead_code)]
     pub client_id: String,
     pub public_addr: SocketAddr,
     pub last_seen: Instant,
@@ -34,9 +35,13 @@ pub fn create_client_registry() -> ClientRegistry {
 
 // Start a periodic cleanup task for the client registry
 pub async fn start_client_cleanup(registry: ClientRegistry, cleanup_interval: Duration, client_timeout: Duration) {
+    info!("Starting client registry cleanup task (interval: {:?}, timeout: {:?})", 
+          cleanup_interval, client_timeout);
+          
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(cleanup_interval).await;
+            debug!("Running periodic client registry cleanup");
             cleanup_stale_clients(registry.clone(), client_timeout).await;
         }
     });
@@ -47,13 +52,22 @@ async fn cleanup_stale_clients(registry: ClientRegistry, timeout: Duration) {
     let now = Instant::now();
     
     let mut reg = registry.lock().await;
+    let client_count = reg.len();
+    debug!("Client registry cleanup: checking {} clients", client_count);
+    
     let stale_ids: Vec<String> = reg
         .iter()
-        .filter(|(_, info)| now.duration_since(info.last_seen) > timeout)
+        .filter(|(_, info)| {
+            let elapsed = now.duration_since(info.last_seen);
+            let is_stale = elapsed > timeout;
+            if is_stale {
+                debug!("Client ID {} inactive for {:?}, marking as stale", info.client_id, elapsed);
+            }
+            is_stale
+        })
         .map(|(id, _)| id.clone())
         .collect();
     
-    let client_count = reg.len();
     let stale_count = stale_ids.len();
     
     for id in stale_ids {
@@ -85,6 +99,7 @@ pub async fn handle_tagio_over_http(req: Request<Body>, client_registry: ClientR
     let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
     
     debug!("Received TagIO over HTTP request with {} bytes from {}", body_bytes.len(), client_addr);
+    info!("Processing TagIO request from client {}", client_addr);
 
     // Initialize response with a 200 OK status by default
     let response = Response::builder()
@@ -94,6 +109,7 @@ pub async fn handle_tagio_over_http(req: Request<Body>, client_registry: ClientR
     // Create response based on the request content
     let response_bytes = if body_bytes.is_empty() {
         // Empty request - return a simple error message
+        error!("Empty request received from {}", client_addr);
         let mut error_response = Vec::new();
         error_response.extend_from_slice(&PROTOCOL_MAGIC);
         error_response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
@@ -101,6 +117,7 @@ pub async fn handle_tagio_over_http(req: Request<Body>, client_registry: ClientR
         error_response
     } else if body_bytes.len() < PROTOCOL_MAGIC.len() || !body_bytes.starts_with(&PROTOCOL_MAGIC) {
         // Invalid protocol - return an error with the correct magic header
+        error!("Invalid protocol data from {}: missing or incorrect magic bytes", client_addr);
         let mut error_response = Vec::new();
         error_response.extend_from_slice(&PROTOCOL_MAGIC);
         error_response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
@@ -108,9 +125,12 @@ pub async fn handle_tagio_over_http(req: Request<Body>, client_registry: ClientR
         error_response
     } else {
         // Valid protocol - parse the message
+        debug!("Valid TagIO protocol message from {}, processing...", client_addr);
         process_tagio_message(&body_bytes, client_registry, client_addr).await
     };
 
+    debug!("Sending response with {} bytes to {}", response_bytes.len(), client_addr);
+    
     // Return the response
     Ok(response.body(Body::from(response_bytes))?)
 }
@@ -122,6 +142,7 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
     
     // Not enough data for a message type
     if data.len() < 4 {
+        error!("Invalid message format from {}: message too short ({} bytes)", client_addr, data.len());
         let mut error_response = Vec::new();
         error_response.extend_from_slice(&PROTOCOL_MAGIC);
         error_response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
@@ -131,6 +152,7 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
     
     // Extract message type
     let message_type = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    debug!("Processing message type {} from {}", message_type, client_addr);
     
     // Process based on message type
     match message_type {
@@ -143,6 +165,7 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             let client_id = generate_unique_client_id(&reg);
             
             info!("New client connection from {}, assigning ID: {}", client_addr, client_id);
+            debug!("Client {} sent PING message, responding with ACK", client_addr);
             
             // Add protocol magic
             response.extend_from_slice(&PROTOCOL_MAGIC);
@@ -154,11 +177,13 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             response.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
             response.extend_from_slice(client_id.as_bytes());
             
+            debug!("Sending ACK response with ID {} to client {}", client_id, client_addr);
             response
         },
         
         // REGISTER: Client registers with assigned ID
         REGISTER_MESSAGE => {
+            debug!("Client {} sent REGISTER message", client_addr);
             let mut response = Vec::new();
             response.extend_from_slice(&PROTOCOL_MAGIC);
             
@@ -167,6 +192,7 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             
             // Check if there's enough data for ID length
             if register_data.len() < 4 {
+                error!("Invalid registration data from {}: data too short", client_addr);
                 response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
                 response.extend_from_slice(b"Invalid registration data");
                 return response;
@@ -180,6 +206,8 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             
             // Check if there's enough data for the ID
             if register_data.len() < 4 + id_len {
+                error!("Invalid ID length from {}: expected {} bytes but got {}", 
+                      client_addr, id_len, register_data.len() - 4);
                 response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
                 response.extend_from_slice(b"Invalid ID length");
                 return response;
@@ -189,11 +217,14 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             let client_id = match std::str::from_utf8(&register_data[4..4+id_len]) {
                 Ok(id) => id.to_string(),
                 Err(_) => {
+                    error!("Invalid ID encoding from {}", client_addr);
                     response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
                     response.extend_from_slice(b"Invalid ID encoding");
                     return response;
                 }
             };
+            
+            debug!("Client {} is registering with ID {}", client_addr, client_id);
             
             // Register the client
             let mut reg = registry.lock().await;
@@ -220,11 +251,13 @@ async fn process_tagio_message(message: &[u8], registry: ClientRegistry, client_
             response.extend_from_slice(ip_str.as_bytes());
             response.extend_from_slice(&client_addr.port().to_be_bytes());
             
+            debug!("Sending REGISTERED response to client {} with ID {}", client_addr, client_id);
             response
         },
         
         // Unknown message type
         _ => {
+            error!("Unknown message type {} from {}", message_type, client_addr);
             let mut response = Vec::new();
             response.extend_from_slice(&PROTOCOL_MAGIC);
             response.extend_from_slice(&ERROR_MESSAGE.to_be_bytes());
@@ -322,35 +355,51 @@ Protocol: TagIO over HTTP tunneling
 /// Start an HTTP server that can accept TagIO protocol messages over HTTP
 pub async fn start_http_tunnel_server(bind_addr: SocketAddr) -> Result<()> {
     // Create the client registry
+    info!("Initializing TagIO HTTP tunnel server on {}", bind_addr);
+    debug!("Creating client registry");
     let client_registry = create_client_registry();
     
     // Start client cleanup task - check every 5 minutes, timeout after 30 minutes of inactivity
+    debug!("Configuring client cleanup parameters");
+    let cleanup_interval = Duration::from_secs(5 * 60); // 5 minutes between cleanup cycles
+    let client_timeout = Duration::from_secs(30 * 60);  // 30 minutes client timeout
+    
+    info!("Starting client cleanup task (interval: {}s, timeout: {}s)",
+          cleanup_interval.as_secs(), client_timeout.as_secs());
+    
     start_client_cleanup(
         client_registry.clone(),
-        Duration::from_secs(5 * 60),     // 5 minutes between cleanup cycles
-        Duration::from_secs(30 * 60)     // 30 minutes client timeout
+        cleanup_interval,
+        client_timeout
     ).await;
     
     // Create the HTTP service
+    debug!("Setting up HTTP service handler");
     let registry = client_registry.clone();
     let make_svc = hyper::service::make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let registry = registry.clone();
         let client_addr = conn.remote_addr();
+        debug!("New connection from {}", client_addr);
         
         async move {
             Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |req: Request<Body>| {
                 let registry = registry.clone();
+                debug!("Handling {} request to {} from {}", 
+                      req.method(), req.uri().path(), client_addr);
                 
                 async move {
                     // Route the request based on the path
                     let response = match (req.method(), req.uri().path()) {
                         (&hyper::Method::GET, "/") | (&hyper::Method::GET, "/status") => {
+                            info!("Serving status page to {}", client_addr);
                             serve_status_page().await
                         }
                         (_, "/tagio") => {
+                            debug!("Handling TagIO request from {}", client_addr);
                             handle_tagio_over_http(req, registry.clone(), client_addr).await
                         }
                         _ => {
+                            info!("Request to unknown path {} from {}", req.uri().path(), client_addr);
                             // Return 404 for any other path, but keep it as 200 OK for compatibility
                             Ok(Response::builder()
                                 .status(StatusCode::OK)
@@ -362,7 +411,7 @@ pub async fn start_http_tunnel_server(bind_addr: SocketAddr) -> Result<()> {
                     match response {
                         Ok(resp) => Ok::<Response<Body>, hyper::http::Error>(resp),
                         Err(e) => {
-                            error!("Error handling HTTP request: {}", e);
+                            error!("Error handling HTTP request from {}: {}", client_addr, e);
                             // Create a simple error response, but use 200 OK for better client compatibility
                             let error_response = Response::builder()
                                 .status(StatusCode::OK)
@@ -377,13 +426,22 @@ pub async fn start_http_tunnel_server(bind_addr: SocketAddr) -> Result<()> {
     });
     
     // Create and run the server
+    info!("Creating HTTP server on {}", bind_addr);
     let server = hyper::Server::bind(&bind_addr)
         .serve(make_svc);
     
-    info!("HTTP tunneling server for TagIO started on {}", bind_addr);
+    info!("HTTP tunneling server for TagIO started successfully on {}", bind_addr);
+    info!("Ready to accept connections...");
     
     // Run the server
-    server.await?;
-    
-    Ok(())
+    match server.await {
+        Ok(_) => {
+            info!("HTTP server shut down gracefully");
+            Ok(())
+        },
+        Err(e) => {
+            error!("HTTP server error: {}", e);
+            Err(anyhow::anyhow!("HTTP server error: {}", e))
+        }
+    }
 } 

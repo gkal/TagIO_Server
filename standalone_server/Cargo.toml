@@ -18,6 +18,7 @@ anyhow = "1.0.71"
 # Serialization - essential for the protocol
 serde = { version = "1.0.163", features = ["derive"] }
 bincode = "1.3.3"
+serde_json = "1.0.96"
 # Logging
 log = "0.4.17"
 env_logger = "0.10.0"
@@ -31,11 +32,15 @@ clap = { version = "4.3.0", features = ["derive"] }
 local-ip-address = "0.5.3"
 # Simple HTTP client for public IP detection
 ureq = { version = "2.9.1", default-features = false, features = ["tls"] }
-serde_json = "1.0.96"
+# Date and time utilities
 chrono = "0.4.24"
+time = "0.3.20"
+# Logging utilities
 fern = "0.6.2"
 colored = "2.0.0"
+# Random number generation
 rand = "0.8.5"
+# HTTP server
 hyper = { version = "0.14", features = ["full"] }
 http = "0.2.9"
 # TLS support for HTTPS server
@@ -43,10 +48,15 @@ rustls = "0.21.6"
 rustls-pemfile = "1.0.2"
 hyper-rustls = { version = "0.24.1", features = ["http1", "http2"] }
 tokio-rustls = "0.24.1"
+# Certificate generation
 rcgen = "0.11.1"
 async-stream = "0.3.5"
 # Client registry static initialization
 lazy_static = "1.4.0"
+# Application directories
+dirs = "5.0.1"
+# Thread-safe lazy initialization
+once_cell = "1.18.0"
 
 [[bin]]
 name = "tagio_relay_server"
