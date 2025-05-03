@@ -195,8 +195,8 @@ fn create_tagio_ack_response(tagio_id: u32) -> Vec<u8> {
     response.extend_from_slice(&[0, 0, 0, 1]);
     // Add ACK message
     response.extend_from_slice(b"ACK");
-    // Add TagIO ID in little-endian format
-    response.extend_from_slice(&tagio_id.to_le_bytes());
+    // Add TagIO ID in big-endian format instead of little-endian
+    response.extend_from_slice(&tagio_id.to_be_bytes());
     response
 }
 
@@ -274,8 +274,8 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                     }
                     // Add ACK message
                     response.extend_from_slice(b"ACK");
-                    // Add TagIO ID in little-endian format
-                    response.extend_from_slice(&tagio_id.to_le_bytes());
+                    // Add TagIO ID in big-endian format
+                    response.extend_from_slice(&tagio_id.to_be_bytes());
                     
                     debug!("Sending ACK response with TagIO ID {}: {}", tagio_id, hex_dump(&response, response.len()));
                     
@@ -294,7 +294,7 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                     if body_bytes.len() >= msg_type_offset + 8 + 4 {  // 8 bytes offset for REGISTER + 4 bytes for ID
                         let id_offset = msg_type_offset + 8;
                         let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
-                        let tagio_id = u32::from_le_bytes([
+                        let tagio_id = u32::from_be_bytes([
                             tagio_id_bytes[0], tagio_id_bytes[1], 
                             tagio_id_bytes[2], tagio_id_bytes[3]
                         ]);
@@ -330,7 +330,7 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                 else if msg_type.contains("MSG") && body_bytes.len() >= msg_type_offset + 3 + 4 { // "MSG" + 4 bytes for target ID
                     let target_id_offset = msg_type_offset + 3; // Skip "MSG"
                     let target_id_bytes = &body_bytes[target_id_offset..target_id_offset + 4];
-                    let target_id = u32::from_le_bytes([
+                    let target_id = u32::from_be_bytes([
                         target_id_bytes[0], target_id_bytes[1], 
                         target_id_bytes[2], target_id_bytes[3]
                     ]);
@@ -500,7 +500,7 @@ fn print_tagio_protocol_spec() {
     println!("[ T ]    Binary: 54 41 47 49 4F 00 00 00 01 50 49 4E 47");
     println!("[ T ]");
     println!("[ T ] 4. ACK message format (server to client):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, little-endian)");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, big-endian)");
     println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
     println!("[ T ]");
     println!("[ T ] 5. MSG message format (bidirectional):");
