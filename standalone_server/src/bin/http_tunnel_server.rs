@@ -44,8 +44,8 @@ fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fer
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "{} [T] {} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                "[T] {} {} [{}] {}",
+                chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S"),
                 record.level(),
                 record.target(),
                 message
@@ -272,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER =====");
+    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.2.1 =====");
     info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
     
     // Check for PORT environment variable (for cloud platforms like Render)

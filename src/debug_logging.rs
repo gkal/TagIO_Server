@@ -72,8 +72,8 @@ pub fn init_debug_logging() {
             return Ok(());
         }
         
-        let timestamp = Local::now().format("%d/%m/%Y %H:%M:%S%.3f");
-        let formatted = format!("{} {} [{}] {}\n", 
+        let timestamp = Local::now().format("%a %d/%m/%Y %H:%M:%S%.3f");
+        let formatted = format!("[T] {} {} [{}] {}\n", 
             timestamp, 
             record.level(),
             record.target(),
@@ -193,10 +193,10 @@ pub fn init_logger() -> Result<()> {
     
     env_logger::Builder::from_env(Env::default().default_filter_or("debug"))
         .format(|buf, record| {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let timestamp = chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S%.3f");
             writeln!(
                 buf,
-                "[{} {} {}:{}] {}",
+                "[T] {} {} {}:{} {}",
                 timestamp,
                 record.level(),
                 record.file().unwrap_or("unknown"),
