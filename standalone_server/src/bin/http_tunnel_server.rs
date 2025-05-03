@@ -66,7 +66,7 @@ fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fer
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[T] {} {} [{}] {}",
+                "[ T ] {} {} [{}] {}",
                 chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S"),
                 record.level(),
                 record.target(),
@@ -484,31 +484,31 @@ async fn cleanup_stale_clients() {
 
 /// Print out the TagIO protocol specification for debugging
 fn print_tagio_protocol_spec() {
-    println!("[T] ===== TAGIO WEBSOCKET PROTOCOL SPECIFICATION =====");
-    println!("[T] WebSocket clients must follow this binary protocol:");
-    println!("[T]");
-    println!("[T] 1. Message Format:");
-    println!("[T]    All messages start with: TAGIO + Version(4 bytes) + Message Type + [Payload]");
-    println!("[T]");
-    println!("[T] 2. To register with server:");
-    println!("[T]    a. Connect to WebSocket endpoint");
-    println!("[T]    b. Send any message to receive TagIO ID");
-    println!("[T]    c. Server will respond with ACK containing your TagIO ID");
-    println!("[T]");
-    println!("[T] 3. PING message format (client to server):");
-    println!("[T]    TAGIO + Version(00 00 00 01) + \"PING\"");
-    println!("[T]    Binary: 54 41 47 49 4F 00 00 00 01 50 49 4E 47");
-    println!("[T]");
-    println!("[T] 4. ACK message format (server to client):");
-    println!("[T]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, little-endian)");
-    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
-    println!("[T]");
-    println!("[T] 5. MSG message format (bidirectional):");
-    println!("[T]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
-    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
-    println!("[T]");
-    println!("[T] Note: All messages must be sent as BINARY WebSocket frames, not text frames");
-    println!("[T] ===================================================");
+    println!("[ T ] ===== TAGIO WEBSOCKET PROTOCOL SPECIFICATION =====");
+    println!("[ T ] WebSocket clients must follow this binary protocol:");
+    println!("[ T ]");
+    println!("[ T ] 1. Message Format:");
+    println!("[ T ]    All messages start with: TAGIO + Version(4 bytes) + Message Type + [Payload]");
+    println!("[ T ]");
+    println!("[ T ] 2. To register with server:");
+    println!("[ T ]    a. Connect to WebSocket endpoint");
+    println!("[ T ]    b. Send any message to receive TagIO ID");
+    println!("[ T ]    c. Server will respond with ACK containing your TagIO ID");
+    println!("[ T ]");
+    println!("[ T ] 3. PING message format (client to server):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"PING\"");
+    println!("[ T ]    Binary: 54 41 47 49 4F 00 00 00 01 50 49 4E 47");
+    println!("[ T ]");
+    println!("[ T ] 4. ACK message format (server to client):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, little-endian)");
+    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
+    println!("[ T ]");
+    println!("[ T ] 5. MSG message format (bidirectional):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
+    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
+    println!("[ T ]");
+    println!("[ T ] Note: All messages must be sent as BINARY WebSocket frames, not text frames");
+    println!("[ T ] ===================================================");
 }
 
 /// Find TagIO magic bytes in a byte array, searching the entire array if needed
@@ -993,7 +993,7 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.0 =====");
+    println!("[ T ] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.1 =====");
     info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
 
     // Print protocol specification
@@ -1059,8 +1059,8 @@ async fn main() -> anyhow::Result<()> {
         .serve(make_svc);
     
     info!("HTTP tunneling server listening on {}", bind_addr);
-    println!("[T] HTTP tunneling server listening on {}", bind_addr);
-    println!("[T] Clients should POST TagIO protocol messages to any endpoint");
+    println!("[ T ] HTTP tunneling server listening on {}", bind_addr);
+    println!("[ T ] Clients should POST TagIO protocol messages to any endpoint");
     
     if let Err(e) = server.await {
         error!("Server error: {}", e);
