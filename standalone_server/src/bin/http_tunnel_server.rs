@@ -686,7 +686,7 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
     let client_ip = "websocket_client".to_string(); // Could extract from connection if needed
     
     // Register this client
-    register_client(tagio_id, client_ip).await;
+    register_client(tagio_id, client_ip.clone()).await;
     
     info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
     
@@ -703,12 +703,12 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
         // Handle different types of WebSocket messages
         match msg {
             WsMessage::Binary(data) => {
-                debug!("Received binary WebSocket message with {} bytes", data.len());
+                info!("Received binary WebSocket message with {} bytes", data.len());
+                info!("Binary message hex dump: {}", hex_dump(&data, data.len().min(100)));
                 
                 if data.len() >= PROTOCOL_MAGIC.len() && &data[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC {
                     // This is a TagIO protocol message
                     info!("Received TagIO protocol message of {} bytes via WebSocket", data.len());
-                    debug!("Message hex dump: {}", hex_dump(&data, 64));
                     
                     // Extract the message type if possible
                     let msg_type = if data.len() >= PROTOCOL_MAGIC.len() + 4 + 4 { // TAGIO + version (4) + msg_type (at least 4)
@@ -723,6 +723,8 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                     
                     // Handle PING specially for WebSocket clients
                     if msg_type.contains("PING") {
+                        info!("Detected PING message, preparing ACK response with TagIO ID: {}", tagio_id);
+                        
                         // Create ACK response with the TagIO ID
                         let mut response = Vec::with_capacity(16);
                         // Add TAGIO magic bytes
@@ -730,23 +732,30 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                         // Add protocol version (same as received)
                         if data.len() >= PROTOCOL_MAGIC.len() + 4 {
                             response.extend_from_slice(&data[PROTOCOL_MAGIC.len()..PROTOCOL_MAGIC.len() + 4]);
+                            info!("Using protocol version from client message");
                         } else {
                             // Default to version 1 if not provided
                             response.extend_from_slice(&[0, 0, 0, 1]);
+                            info!("Using default protocol version [0, 0, 0, 1]");
                         }
                         // Add ACK message
                         response.extend_from_slice(b"ACK");
                         // Add TagIO ID in little-endian format
                         response.extend_from_slice(&tagio_id.to_le_bytes());
                         
-                        debug!("Sending ACK response with TagIO ID {} via WebSocket: {}", 
-                               tagio_id, hex_dump(&response, response.len()));
+                        info!("Sending ACK response with TagIO ID {} via WebSocket", tagio_id);
+                        info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
                         
                         // Send the response via WebSocket
-                        if let Err(e) = ws_sender.send(WsMessage::Binary(response)).await {
-                            error!("Error sending WebSocket ACK response: {}", e);
-                            break;
-                        }
+                        match ws_sender.send(WsMessage::Binary(response.clone())).await {
+                            Ok(_) => {
+                                info!("Successfully sent ACK response with TagIO ID {} to client", tagio_id);
+                            },
+                            Err(e) => {
+                                error!("Error sending WebSocket ACK response: {}", e);
+                                break;
+                            }
+                        };
                         
                         // Update client's last seen timestamp
                         update_client_timestamp(tagio_id).await;
@@ -758,7 +767,12 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                         Ok(response) => {
                             // Extract the body bytes from the HTTP response
                             let body_bytes = match hyper::body::to_bytes(response.into_body()).await {
-                                Ok(bytes) => bytes.to_vec(),
+                                Ok(bytes) => {
+                                    let bytes_vec = bytes.to_vec();
+                                    info!("Prepared response of {} bytes", bytes_vec.len());
+                                    info!("Response hex dump: {}", hex_dump(&bytes_vec, std::cmp::min(bytes_vec.len(), 100)));
+                                    bytes_vec
+                                },
                                 Err(e) => {
                                     error!("Error extracting response body: {}", e);
                                     continue;
@@ -766,23 +780,33 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                             };
                             
                             // Send the TagIO response back as a binary WebSocket message
-                            debug!("Sending TagIO response of {} bytes via WebSocket", body_bytes.len());
-                            debug!("Response hex dump: {}", hex_dump(&body_bytes, 64));
+                            info!("Sending TagIO response of {} bytes via WebSocket", body_bytes.len());
                             
-                            if let Err(e) = ws_sender.send(WsMessage::Binary(body_bytes)).await {
-                                error!("Error sending WebSocket response: {}", e);
-                                break;
-                            }
+                            match ws_sender.send(WsMessage::Binary(body_bytes.clone())).await {
+                                Ok(_) => {
+                                    info!("Successfully sent {} bytes response to client", body_bytes.len());
+                                },
+                                Err(e) => {
+                                    error!("Error sending WebSocket response: {}", e);
+                                    break;
+                                }
+                            };
                         },
                         Err(e) => {
                             error!("Error handling TagIO protocol via WebSocket: {}", e);
-                            if let Err(e) = ws_sender.send(WsMessage::Text(format!("Error: {}", e))).await {
+                            let error_msg = format!("Error: {}", e);
+                            if let Err(e) = ws_sender.send(WsMessage::Text(error_msg)).await {
                                 error!("Error sending WebSocket error response: {}", e);
                             }
                         }
                     }
                 } else {
                     warn!("Received binary WebSocket message without valid TagIO protocol magic bytes");
+                    warn!("Expected magic: {}, received: {}", 
+                          hex_dump(PROTOCOL_MAGIC, PROTOCOL_MAGIC.len()), 
+                          hex_dump(&data[0..std::cmp::min(data.len(), PROTOCOL_MAGIC.len())], 
+                                  std::cmp::min(data.len(), PROTOCOL_MAGIC.len())));
+                    
                     let error_msg = format!("Invalid TagIO protocol message, expected magic bytes: {}", 
                                            hex_dump(PROTOCOL_MAGIC, PROTOCOL_MAGIC.len()));
                     if let Err(e) = ws_sender.send(WsMessage::Text(error_msg)).await {
@@ -791,7 +815,7 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                 }
             },
             WsMessage::Text(text) => {
-                debug!("Received text WebSocket message: {}", text);
+                info!("Received text WebSocket message: {}", text);
                 // Respond with a text message indicating we expect binary data
                 let response = "TagIO server expects binary protocol messages. Your TagIO ID is: ".to_string() + &tagio_id.to_string();
                 if let Err(e) = ws_sender.send(WsMessage::Text(response)).await {
@@ -800,7 +824,7 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
             },
             WsMessage::Ping(data) => {
                 // Respond to ping with pong
-                debug!("Received WebSocket ping");
+                info!("Received WebSocket ping, sending pong");
                 if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
                     error!("Error sending WebSocket pong: {}", e);
                 }
@@ -810,7 +834,7 @@ async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::
                 debug!("Received WebSocket pong");
             },
             WsMessage::Close(_) => {
-                debug!("Received WebSocket close frame");
+                info!("Received WebSocket close frame");
                 break;
             },
             _ => {
