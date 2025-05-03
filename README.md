@@ -89,13 +89,77 @@ The server is designed to be easily deployed to cloud platforms like Render.com:
 ## TagIO Protocol
 
 The TagIO protocol uses:
-- Magic bytes: "TAGIO"
-- Protocol version: 4 bytes (default: 0.0.0.1)
+- Magic bytes: "TAGIO" (ASCII: 54 41 47 49 4F)
+- Protocol version: 4 bytes (default: 00 00 00 01)
 - Message type: ASCII (e.g., "PING", "ACK", "MSG")
-- Client ID: 4-byte unique identifier
+- Client ID: 4-byte unique identifier in **big-endian** format
 - Optional payload data
 
 The server automatically assigns TagIO IDs in the range 5000-9999 to connected clients.
+
+### Protocol Message Formats
+
+1. **ACK Response** (server → client):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "ACK" + [Client ID: 4 bytes, big-endian]
+   ```
+   Example: `54 41 47 49 4F 00 00 00 01 41 43 4B 00 00 19 FB` (ID: 6651)
+
+2. **PING Message** (client → server):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "PING"
+   ```
+   Example: `54 41 47 49 4F 00 00 00 01 50 49 4E 47`
+
+3. **REGL Message** (client → server):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "REGL" + "REGISTER:<assigned_id>"
+   ```
+   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 52 45 47 49 53 54 45 52 3A 37 38 39 30`
+
+4. **REGLACK Message** (server → client):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "REGLACK"
+   ```
+   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 41 43 4B`
+
+5. **REGLERR Message** (server → client on error):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "REGLERR" + [Error message]
+   ```
+   Error types: `ID_MISMATCH`, `INVALID_ID`, `MISSING_ID`, `MISSING_REGISTER`, `INVALID_FORMAT`
+   
+   Example: `54 41 47 49 4F 00 00 00 01 52 45 47 4C 45 52 52 49 44 5F 4D 49 53 4D 41 54 43 48` (ID_MISMATCH)
+
+6. **MSG Message** (bidirectional):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "MSG" + [Target ID: 4 bytes, big-endian] + [Payload]
+   ```
+
+7. **REGISTER Message** (client → server):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "REGISTER" + [Client ID: 4 bytes, big-endian]
+   ```
+
+8. **REG_ACK Message** (server → client):
+   ```
+   TAGIO + [Version: 00 00 00 01] + "REG_ACK"
+   ```
+
+### Endianness Note
+
+**IMPORTANT:** As of version 0.3.1, all numeric identifiers in the TagIO protocol are encoded in **big-endian** format. Previous versions used little-endian encoding, which could cause data corruption when clients and servers had different expectations.
+
+## WebSocket Implementation
+
+When using WebSockets with TagIO:
+
+1. All protocol messages must be sent as binary WebSocket frames (opcode 0x02)
+2. The server validates WebSocket connections by checking for proper upgrade headers
+3. Clients must use proper WebSocket framing and masking
+4. Binary frames containing TagIO protocol data are automatically parsed and processed
+5. The server supports WebSocket ping/pong frames for keepalive connections
+6. Inactive WebSocket connections are cleaned up after 1 hour of inactivity
 
 ## License
 

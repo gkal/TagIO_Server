@@ -494,6 +494,8 @@ fn print_tagio_protocol_spec() {
     println!("[ T ]    a. Connect to WebSocket endpoint");
     println!("[ T ]    b. Send any message to receive TagIO ID");
     println!("[ T ]    c. Server will respond with ACK containing your TagIO ID");
+    println!("[ T ]    d. Client should confirm by sending REGL with REGISTER:<assigned_id>");
+    println!("[ T ]    e. Server will respond with REGLACK message");
     println!("[ T ]");
     println!("[ T ] 3. PING message format (client to server):");
     println!("[ T ]    TAGIO + Version(00 00 00 01) + \"PING\"");
@@ -503,7 +505,20 @@ fn print_tagio_protocol_spec() {
     println!("[ T ]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, big-endian)");
     println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
     println!("[ T ]");
-    println!("[ T ] 5. MSG message format (bidirectional):");
+    println!("[ T ] 5. REGL message format (client to server):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGL\" + \"REGISTER:<assigned_id>\"");
+    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 52 45 47 49 53 54 45 52 3A 37 38 39 30");
+    println!("[ T ]");
+    println!("[ T ] 6. REGLACK message format (server to client):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGLACK\"");
+    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 41 43 4B");
+    println!("[ T ]");
+    println!("[ T ] 7. REGLERR message format (server to client on error):");
+    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGLERR\" + [Error message]");
+    println!("[ T ]    Error types: ID_MISMATCH, INVALID_ID, MISSING_ID, MISSING_REGISTER, INVALID_FORMAT");
+    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 45 52 52 49 44 5F 4D 49 53 4D 41 54 43 48");
+    println!("[ T ]");
+    println!("[ T ] 8. MSG message format (bidirectional):");
     println!("[ T ]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
     println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
     println!("[ T ]");
@@ -772,13 +787,101 @@ async fn handle_ws_binary_message(
         false
     };
     
-    // Create an ACK response immediately
+    // Extract the message type if possible
+    let msg_type = if has_tagio_magic && data.len() >= PROTOCOL_MAGIC.len() + 4 + 3 { 
+        let magic_pos = find_tagio_magic(&data).unwrap_or(0);
+        let msg_type_offset = magic_pos + PROTOCOL_MAGIC.len() + 4;
+        
+        if msg_type_offset < data.len() {
+            let msg_type_bytes = &data[msg_type_offset..];
+            String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
+        } else {
+            "UNKNOWN".to_string()
+        }
+    } else {
+        "UNKNOWN".to_string()
+    };
+    
+    info!("TagIO message type via WebSocket from {}: {}", client_ip, msg_type);
+    
+    // Handle REGL message specifically
+    if msg_type.contains("REGL") {
+        info!("Received REGL message from client {}, handling registration confirmation", client_ip);
+        
+        // Track if we successfully extracted a valid ID
+        let mut id_valid = false;
+        let mut error_msg = "INVALID_FORMAT";
+        
+        // Extract client ID if included in REGISTER message
+        if let Some(register_info) = msg_type.find("REGISTER:") {
+            if register_info + 9 < msg_type.len() {
+                match msg_type[register_info + 9..].parse::<u32>() {
+                    Ok(client_provided_id) => {
+                        info!("Client provided TagIO ID: {}", client_provided_id);
+                        
+                        // Verify that the client is using the same ID we assigned
+                        if client_provided_id == tagio_id {
+                            info!("Client confirmed the correct TagIO ID: {}", tagio_id);
+                            id_valid = true;
+                        } else {
+                            error_msg = "ID_MISMATCH";
+                            warn!("Client provided TagIO ID {} doesn't match the assigned ID {}", 
+                                  client_provided_id, tagio_id);
+                        }
+                        
+                        // Register or update this client with their provided ID
+                        register_client(client_provided_id, client_ip.to_string()).await;
+                    },
+                    Err(e) => {
+                        error_msg = "INVALID_ID";
+                        error!("Failed to parse TagIO ID from REGISTER message: {}", e);
+                    }
+                }
+            } else {
+                error_msg = "MISSING_ID";
+                error!("REGISTER message format invalid, missing ID value");
+            }
+        } else {
+            error_msg = "MISSING_REGISTER";
+            error!("REGL message doesn't contain REGISTER instruction");
+        }
+        
+        // Create appropriate response based on validation result
+        let mut response = Vec::with_capacity(32);
+        // Add TAGIO magic bytes
+        response.extend_from_slice(PROTOCOL_MAGIC);
+        // Use protocol version 1
+        response.extend_from_slice(&[0, 0, 0, 1]);
+        
+        if id_valid {
+            // Add REGLACK message
+            response.extend_from_slice(b"REGLACK");
+            info!("Sending REGLACK response to client {}", client_ip);
+        } else {
+            // Add REGLERR message with error reason
+            response.extend_from_slice(b"REGLERR");
+            response.extend_from_slice(error_msg.as_bytes());
+            error!("Sending REGLERR response to client {}: {}", client_ip, error_msg);
+        }
+        
+        info!("Response hex dump: {}", hex_dump(&response, response.len()));
+        
+        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
+            error!("Error sending registration response to {}: {}", client_ip, e);
+            return Err(anyhow::anyhow!("Failed to send registration response: {}", e));
+        } else {
+            info!("Successfully sent registration response to client {}", client_ip);
+            return Ok(());
+        }
+    }
+    
+    // For other message types, send the standard ACK response
     let response = create_tagio_ack_response(tagio_id);
     
     info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
     info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
     
-    // CRITICAL FIX: Make sure we're sending pure TagIO protocol data wrapped in a WebSocket binary frame
+    // Send TagIO protocol data wrapped in a WebSocket binary frame
     if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
         error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
         return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
@@ -789,23 +892,6 @@ async fn handle_ws_binary_message(
     // Only do additional protocol processing if we detected TagIO data
     if has_tagio_magic {
         info!("Received TagIO protocol message of {} bytes via WebSocket from {}", data.len(), client_ip);
-        
-        // Extract the message type if possible
-        let msg_type = if data.len() >= PROTOCOL_MAGIC.len() + 4 + 3 { 
-            let magic_pos = find_tagio_magic(&data).unwrap_or(0);
-            let msg_type_offset = magic_pos + PROTOCOL_MAGIC.len() + 4;
-            
-            if msg_type_offset < data.len() {
-                let msg_type_bytes = &data[msg_type_offset..];
-                String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
-            } else {
-                "UNKNOWN".to_string()
-            }
-        } else {
-            "UNKNOWN".to_string()
-        };
-        
-        info!("TagIO message type via WebSocket from {}: {}", client_ip, msg_type);
     }
     
     Ok(())
