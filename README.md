@@ -4,7 +4,7 @@
 
 The TagIO HTTP Tunnel Server provides both HTTP tunneling and WebSocket capabilities for TagIO protocol clients, facilitating communication between clients behind firewalls or NAT devices. This server acts as a bridge for the TagIO protocol (a custom binary protocol for efficient device communication).
 
-## Current Version: 0.3.0
+## Current Version: 0.3.1
 
 Recent enhancements:
 - Improved code organization and reduced complexity through refactoring
@@ -12,6 +12,7 @@ Recent enhancements:
 - Added helper functions to reduce code duplication
 - Fixed naming conflicts in the build process
 - Streamlined status page HTML
+- Updated log format for better readability
 
 ## Project Structure
 

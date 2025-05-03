@@ -4,7 +4,7 @@
 
 This standalone server provides HTTP tunneling and WebSocket capabilities for the TagIO protocol, enabling communication for clients behind firewalls or NAT devices.
 
-## Current Version: 0.3.0
+## Current Version: 0.3.1
 
 Recent improvements:
 - Refactored for better code organization
@@ -12,6 +12,7 @@ Recent improvements:
 - Improved error management
 - Better protocol detection logic
 - Reduced code duplication with helper functions
+- Updated log format for better readability
 
 ## Features
 
