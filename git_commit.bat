@@ -1,7 +1,29 @@
-git status
+@echo off
 
+git status
 git add .
 
-git commit -m "%~1" 
+:: Use %* to capture the entire command line
+set "commit_msg=%*"
 
-git push origin main 
+:: Display the message for verification
+echo.
+echo Committing with message: "%commit_msg%"
+echo.
+
+:: Wait for user confirmation
+set /p confirm="Proceed with commit? (Y/N): "
+if /i not "%confirm%"=="Y" (
+    echo Commit canceled.
+    exit /b
+)
+
+:: Perform the commit
+git commit -m "%commit_msg%"
+
+:: Push the changes
+git push origin main
+
+echo.
+echo Changes committed and pushed successfully.
+echo. 
