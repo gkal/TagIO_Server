@@ -12,6 +12,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
 use rand::Rng;
+use futures::{SinkExt, StreamExt};
+use hyper_tungstenite::tungstenite::Message as WsMessage;
+use hyper_tungstenite::WebSocketStream;
 
 // Constants for protocol magic
 const PROTOCOL_MAGIC: &[u8] = b"TAGIO";
@@ -380,6 +383,13 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
             border-bottom: 1px solid #eee;
             padding-bottom: 10px;
         }}
+        h2 {{
+            color: #3498db;
+            margin-top: 25px;
+        }}
+        h3 {{
+            color: #e67e22;
+        }}
         .status {{
             background-color: #e8f5e9;
             border-left: 5px solid #4caf50;
@@ -410,6 +420,47 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
             padding: 15px;
             margin: 20px 0;
         }}
+        .success {{
+            background-color: #e8f5e9;
+            border-left: 5px solid #4caf50;
+            padding: 15px;
+            margin: 20px 0;
+        }}
+        .tab {{
+            overflow: hidden;
+            border: 1px solid #ccc;
+            background-color: #f1f1f1;
+            border-radius: 4px 4px 0 0;
+        }}
+        .tab button {{
+            background-color: inherit;
+            float: left;
+            border: none;
+            outline: none;
+            cursor: pointer;
+            padding: 14px 16px;
+            transition: 0.3s;
+            font-size: 16px;
+        }}
+        .tab button:hover {{
+            background-color: #ddd;
+        }}
+        .tab button.active {{
+            background-color: #3498db;
+            color: white;
+        }}
+        .tabcontent {{
+            display: none;
+            padding: 6px 12px;
+            border: 1px solid #ccc;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+            animation: fadeEffect 1s;
+        }}
+        @keyframes fadeEffect {{
+            from {{opacity: 0;}}
+            to {{opacity: 1;}}
+        }}
         code {{
             background-color: #f5f5f5;
             padding: 2px 4px;
@@ -423,7 +474,7 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
     
     <div class="status">
         <h2>Server Status: Online</h2>
-        <p>The TagIO HTTP tunnel server is running and ready to accept connections.</p>
+        <p>The TagIO server is running and ready to accept connections through either HTTP tunneling or WebSocket.</p>
     </div>
     
     <div class="clients">
@@ -431,33 +482,39 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
         <p>Number of TagIO clients currently registered with the server.</p>
     </div>
     
-    <h2>Connection Information</h2>
-    <p>To connect to this TagIO HTTP tunnel server, use the following information:</p>
+    <div class="tab">
+        <button class="tablinks" onclick="openConnectionMethod(event, 'HTTP')" id="defaultOpen">HTTP Tunnel</button>
+        <button class="tablinks" onclick="openConnectionMethod(event, 'WebSocket')">WebSocket</button>
+    </div>
     
-    <pre>
+    <div id="HTTP" class="tabcontent">
+        <h2>HTTP Tunnel Connection</h2>
+        <p>To connect to TagIO using HTTP tunneling, use the following information:</p>
+        
+        <pre>
 Server: This domain (same as in your browser address bar)
 Port: 443 (HTTPS)
 Protocol: TagIO over HTTP tunneling
 </pre>
-    
-    <div class="note">
-        <h3>Important Note for Client Applications</h3>
-        <p>This server implements TagIO protocol tunneling over HTTPS. Client applications must wrap TagIO protocol messages 
-        in HTTP POST requests to any endpoint. The server is accessible only via HTTPS on the standard port 443.</p>
-        <p>You do NOT need to specify any special port in your client configuration.</p>
-    </div>
-    
-    <div class="error">
-        <h3>Troubleshooting Cloudflare 400 Bad Request Errors</h3>
-        <p>If your client is receiving 400 Bad Request errors from Cloudflare, ensure your HTTP request is properly formatted:</p>
-        <ul>
-            <li>Use a valid HTTP POST request with TagIO data in the body</li>
-            <li>Set <code>Content-Type: application/octet-stream</code> header</li>
-            <li>Set <code>Content-Length</code> header with the correct byte length</li>
-            <li>Include <code>X-TagIO-Protocol: true</code> header to help our server identify TagIO traffic</li>
-        </ul>
-        <p>Example HTTP request:</p>
-        <pre>
+        
+        <div class="note">
+            <h3>Important Note for HTTP Tunnel Clients</h3>
+            <p>This server implements TagIO protocol tunneling over HTTPS. Client applications must wrap TagIO protocol messages 
+            in HTTP POST requests to any endpoint. The server is accessible only via HTTPS on the standard port 443.</p>
+            <p>You do NOT need to specify any special port in your client configuration.</p>
+        </div>
+        
+        <div class="error">
+            <h3>Troubleshooting Cloudflare 400 Bad Request Errors</h3>
+            <p>If your client is receiving 400 Bad Request errors from Cloudflare, ensure your HTTP request is properly formatted:</p>
+            <ul>
+                <li>Use a valid HTTP POST request with TagIO data in the body</li>
+                <li>Set <code>Content-Type: application/octet-stream</code> header</li>
+                <li>Set <code>Content-Length</code> header with the correct byte length</li>
+                <li>Include <code>X-TagIO-Protocol: true</code> header to help our server identify TagIO traffic</li>
+            </ul>
+            <p>Example HTTP request:</p>
+            <pre>
 POST / HTTP/1.1
 Host: tagio-server.onrender.com
 Content-Type: application/octet-stream
@@ -466,19 +523,90 @@ X-TagIO-Protocol: true
 
 [TAGIO BINARY DATA]
 </pre>
+        </div>
+    </div>
+    
+    <div id="WebSocket" class="tabcontent">
+        <h2>WebSocket Connection (Recommended)</h2>
+        <p>To connect to TagIO using WebSocket, use the following information:</p>
+        
+        <pre>
+Server: This domain (same as in your browser address bar)
+URL: wss://[this-domain]/ws
+Protocol: TagIO over WebSocket
+</pre>
+        
+        <div class="success">
+            <h3>WebSocket Benefits</h3>
+            <p>WebSocket connections provide several advantages over HTTP tunneling:</p>
+            <ul>
+                <li>Better performance with lower latency</li>
+                <li>No risk of Cloudflare 400 Bad Request errors</li>
+                <li>Automatic reconnection handling</li>
+                <li>Bi-directional communication without overhead</li>
+                <li>Simpler client implementation</li>
+            </ul>
+        </div>
+        
+        <div class="note">
+            <h3>Important Note for WebSocket Clients</h3>
+            <p>When using WebSocket connections:</p>
+            <ul>
+                <li>Send TagIO binary protocol data as binary WebSocket frames</li>
+                <li>No HTTP headers are needed - just the raw TagIO protocol data</li>
+                <li>The server will respond with binary WebSocket frames containing raw TagIO protocol responses</li>
+                <li>The server automatically assigns a TagIO ID when you first connect</li>
+            </ul>
+        </div>
+        
+        <p>Example WebSocket client initialization:</p>
+        <pre>
+const socket = new WebSocket('wss://tagio-server.onrender.com/ws');
+socket.binaryType = 'arraybuffer';
+
+// Send TagIO protocol data
+socket.onopen = () => {{{{
+  const pingMsg = new Uint8Array([...TAGIO_MAGIC, 0, 0, 0, 1, /* PING message */]);
+  socket.send(pingMsg);
+}}}};
+
+// Receive TagIO protocol responses
+socket.onmessage = (event) => {{{{
+  const data = new Uint8Array(event.data);
+  // Process TagIO protocol data
+}}}};
+</pre>
     </div>
     
     <h2>For Developers</h2>
     <p>TagIO clients should:</p>
     <ol>
-        <li>Connect to this server via HTTPS (port 443)</li>
-        <li>Send TagIO protocol messages in the body of POST requests</li>
-        <li>Include proper HTTP headers (especially Content-Type)</li>
-        <li>Read responses from the HTTP response body</li>
+        <li>Preferably use WebSocket connections for better reliability</li>
+        <li>When using HTTP, send TagIO protocol messages in the body of POST requests</li>
+        <li>Include proper HTTP headers for HTTP connections (especially Content-Type)</li>
         <li>Do not attempt to connect directly to internal port 10000</li>
     </ol>
     
     <p>For more information, please refer to the TagIO documentation.</p>
+    
+    <script>
+    function openConnectionMethod(evt, methodName) {{{{
+        var i, tabcontent, tablinks;
+        tabcontent = document.getElementsByClassName("tabcontent");
+        for (i = 0; i < tabcontent.length; i++) {{{{
+            tabcontent[i].style.display = "none";
+        }}}}
+        tablinks = document.getElementsByClassName("tablinks");
+        for (i = 0; i < tablinks.length; i++) {{{{
+            tablinks[i].className = tablinks[i].className.replace(" active", "");
+        }}}}
+        document.getElementById(methodName).style.display = "block";
+        evt.currentTarget.className += " active";
+    }}}}
+    
+    // Get the element with id="defaultOpen" and click on it
+    document.getElementById("defaultOpen").click();
+    </script>
 </body>
 </html>
     "#, client_count);
@@ -545,6 +673,165 @@ async fn cleanup_stale_clients() {
                   to_remove.len(), registry.len());
         }
     }
+}
+
+// Add a function to handle WebSocket client registration
+async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>) -> Result<(), anyhow::Error> {
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    info!("Handling WebSocket connection for TagIO client");
+    
+    // Generate a unique TagIO ID for this client
+    let tagio_id = generate_unique_tagio_id().await;
+    let client_ip = "websocket_client".to_string(); // Could extract from connection if needed
+    
+    // Register this client
+    register_client(tagio_id, client_ip).await;
+    
+    info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
+    
+    // Process incoming WebSocket messages
+    while let Some(msg_result) = ws_receiver.next().await {
+        let msg = match msg_result {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Error receiving WebSocket message: {}", e);
+                break;
+            }
+        };
+        
+        // Handle different types of WebSocket messages
+        match msg {
+            WsMessage::Binary(data) => {
+                debug!("Received binary WebSocket message with {} bytes", data.len());
+                
+                if data.len() >= PROTOCOL_MAGIC.len() && &data[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC {
+                    // This is a TagIO protocol message
+                    info!("Received TagIO protocol message of {} bytes via WebSocket", data.len());
+                    debug!("Message hex dump: {}", hex_dump(&data, 64));
+                    
+                    // Extract the message type if possible
+                    let msg_type = if data.len() >= PROTOCOL_MAGIC.len() + 4 + 4 { // TAGIO + version (4) + msg_type (at least 4)
+                        let msg_type_offset = PROTOCOL_MAGIC.len() + 4;
+                        let msg_type_bytes = &data[msg_type_offset..];
+                        String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
+                    } else {
+                        "UNKNOWN".to_string()
+                    };
+                    
+                    info!("TagIO message type via WebSocket: {}", msg_type);
+                    
+                    // Handle PING specially for WebSocket clients
+                    if msg_type.contains("PING") {
+                        // Create ACK response with the TagIO ID
+                        let mut response = Vec::with_capacity(16);
+                        // Add TAGIO magic bytes
+                        response.extend_from_slice(PROTOCOL_MAGIC);
+                        // Add protocol version (same as received)
+                        if data.len() >= PROTOCOL_MAGIC.len() + 4 {
+                            response.extend_from_slice(&data[PROTOCOL_MAGIC.len()..PROTOCOL_MAGIC.len() + 4]);
+                        } else {
+                            // Default to version 1 if not provided
+                            response.extend_from_slice(&[0, 0, 0, 1]);
+                        }
+                        // Add ACK message
+                        response.extend_from_slice(b"ACK");
+                        // Add TagIO ID in little-endian format
+                        response.extend_from_slice(&tagio_id.to_le_bytes());
+                        
+                        debug!("Sending ACK response with TagIO ID {} via WebSocket: {}", 
+                               tagio_id, hex_dump(&response, response.len()));
+                        
+                        // Send the response via WebSocket
+                        if let Err(e) = ws_sender.send(WsMessage::Binary(response)).await {
+                            error!("Error sending WebSocket ACK response: {}", e);
+                            break;
+                        }
+                        
+                        // Update client's last seen timestamp
+                        update_client_timestamp(tagio_id).await;
+                        continue;
+                    }
+                    
+                    // For other TagIO messages, process them normally
+                    match handle_tagio_over_http(data, None).await {
+                        Ok(response) => {
+                            // Extract the body bytes from the HTTP response
+                            let body_bytes = match hyper::body::to_bytes(response.into_body()).await {
+                                Ok(bytes) => bytes.to_vec(),
+                                Err(e) => {
+                                    error!("Error extracting response body: {}", e);
+                                    continue;
+                                }
+                            };
+                            
+                            // Send the TagIO response back as a binary WebSocket message
+                            debug!("Sending TagIO response of {} bytes via WebSocket", body_bytes.len());
+                            debug!("Response hex dump: {}", hex_dump(&body_bytes, 64));
+                            
+                            if let Err(e) = ws_sender.send(WsMessage::Binary(body_bytes)).await {
+                                error!("Error sending WebSocket response: {}", e);
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            error!("Error handling TagIO protocol via WebSocket: {}", e);
+                            if let Err(e) = ws_sender.send(WsMessage::Text(format!("Error: {}", e))).await {
+                                error!("Error sending WebSocket error response: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    warn!("Received binary WebSocket message without valid TagIO protocol magic bytes");
+                    let error_msg = format!("Invalid TagIO protocol message, expected magic bytes: {}", 
+                                           hex_dump(PROTOCOL_MAGIC, PROTOCOL_MAGIC.len()));
+                    if let Err(e) = ws_sender.send(WsMessage::Text(error_msg)).await {
+                        error!("Error sending WebSocket error response: {}", e);
+                    }
+                }
+            },
+            WsMessage::Text(text) => {
+                debug!("Received text WebSocket message: {}", text);
+                // Respond with a text message indicating we expect binary data
+                let response = "TagIO server expects binary protocol messages. Your TagIO ID is: ".to_string() + &tagio_id.to_string();
+                if let Err(e) = ws_sender.send(WsMessage::Text(response)).await {
+                    error!("Error sending WebSocket text response: {}", e);
+                }
+            },
+            WsMessage::Ping(data) => {
+                // Respond to ping with pong
+                debug!("Received WebSocket ping");
+                if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
+                    error!("Error sending WebSocket pong: {}", e);
+                }
+            },
+            WsMessage::Pong(_) => {
+                // Just log pongs
+                debug!("Received WebSocket pong");
+            },
+            WsMessage::Close(_) => {
+                debug!("Received WebSocket close frame");
+                break;
+            },
+            _ => {
+                // Unknown message type
+                debug!("Received unknown WebSocket message type");
+            }
+        }
+        
+        // Update client's last seen timestamp after each message
+        update_client_timestamp(tagio_id).await;
+    }
+    
+    // Remove client from registry when WebSocket closes
+    let mut registry = CLIENT_REGISTRY.write().await;
+    if let Some(_client) = registry.values().find(|c| c.tagio_id == tagio_id) {
+        info!("WebSocket connection closed for client {}, removing from registry", tagio_id);
+        registry.retain(|_, c| c.tagio_id != tagio_id);
+    }
+    
+    info!("WebSocket connection closed");
+    Ok(())
 }
 
 #[tokio::main]
@@ -615,6 +902,42 @@ async fn main() -> anyhow::Result<()> {
                         .to_string();
                     
                     info!("Received HTTP request: {} {} from {:?}", method, path, host);
+                    
+                    // Check for WebSocket upgrade request
+                    if hyper_tungstenite::is_upgrade_request(&req) {
+                        info!("Detected WebSocket upgrade request from {}", host);
+                        
+                        // No need to clone, pass a mutable reference to the original request
+                        // Handle the WebSocket connection
+                        let (response, websocket) = match hyper_tungstenite::upgrade(req, None) {
+                            Ok(upgrade) => upgrade,
+                            Err(e) => {
+                                error!("Failed to upgrade WebSocket connection: {}", e);
+                                return Ok::<_, hyper::http::Error>(Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Body::from("Failed to upgrade to WebSocket"))
+                                    .unwrap());
+                            }
+                        };
+                        
+                        // Spawn a new task to handle the WebSocket connection
+                        tokio::spawn(async move {
+                            match websocket.await {
+                                Ok(ws_stream) => {
+                                    info!("WebSocket connection established");
+                                    if let Err(e) = handle_websocket_client_registration(ws_stream).await {
+                                        error!("Error in WebSocket connection: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Error upgrading WebSocket connection: {}", e);
+                                }
+                            }
+                        });
+                        
+                        // Return the response to complete the WebSocket handshake
+                        return Ok(response);
+                    }
                     
                     // Check Render-specific headers for SSL termination info
                     let x_forwarded_proto = req.headers().get("x-forwarded-proto")
