@@ -1,9 +1,9 @@
 [package]
-name = "tagio_relay_server"
+name = "http_tunnel_server"
 version = "0.2.1"
 edition = "2021"
 authors = ["TagIO Team"]
-description = "TagIO Relay Server - Standalone NAT traversal server for TagIO"
+description = "TagIO HTTP Tunnel Server - Standalone HTTP tunneling server for TagIO"
 default-run = "http_tunnel_server"
 
 [features]
@@ -47,11 +47,6 @@ rcgen = "0.11.1"
 async-stream = "0.3.5"
 # Client registry static initialization
 lazy_static = "1.4.0"
-
-[[bin]]
-name = "tagio_relay_server"
-path = "src/main.rs"
-required-features = ["server"]
 
 [[bin]]
 name = "http_tunnel_server"

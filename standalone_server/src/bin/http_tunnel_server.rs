@@ -17,6 +17,7 @@ const PROTOCOL_MAGIC: &[u8] = b"TAGIO";
 
 // Client registry to track connected clients
 #[derive(Clone)]
+#[allow(dead_code)] // Allow unused fields as they may be useful in the future
 struct ClientInfo {
     tagio_id: u32,
     ip_address: String,
@@ -202,6 +203,21 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                 if msg_type.contains("PING") {
                     info!("Received PING from client, sending ACK response");
                     
+                    // Extract TagIO ID if included in the message (should be right after "PING")
+                    if body_bytes.len() >= msg_type_offset + 4 + 4 {  // 4 bytes for "PING" + 4 bytes for ID
+                        let id_offset = msg_type_offset + 4;
+                        let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
+                        if tagio_id_bytes.len() == 4 {
+                            let tagio_id = u32::from_le_bytes([
+                                tagio_id_bytes[0], tagio_id_bytes[1], 
+                                tagio_id_bytes[2], tagio_id_bytes[3]
+                            ]);
+                            
+                            // Update client activity
+                            update_client_timestamp(tagio_id).await;
+                        }
+                    }
+                    
                     // Create ACK response
                     // Protocol format: TAGIO + protocol version (4 bytes) + "ACK" message
                     let mut response = Vec::with_capacity(12);
@@ -276,6 +292,9 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                     ]);
                     
                     info!("Message targeted at client ID: {}", target_id);
+                    
+                    // Update activity for the target client
+                    update_client_timestamp(target_id).await;
                     
                     // Look up the target client in our registry
                     if let Some(target_client) = get_client_by_id(target_id).await {

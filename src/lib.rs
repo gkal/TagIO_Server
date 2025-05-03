@@ -1,23 +1,15 @@
-// Export all the modules so they can be imported from crate root
-pub mod config;
-pub mod relay;
-pub mod nat_traversal;
-pub mod p2p_tls;
-pub mod cert_utils;
-pub mod network_speed;
-pub mod input;
-pub mod debug_logging;
-pub mod streaming;
+// This is just a placeholder library to satisfy Cargo requirements
+// The actual HTTP tunnel server is in standalone_server/src/bin/http_tunnel_server.rs
 
-// Re-export common constants
-pub const VERSION: &str = "0.1.9";
-pub use relay::constants::*;
-pub use nat_traversal::client::NatTraversalClient;
-pub use p2p_tls::{P2PTlsClient, TlsStream, TlsServerStream, TlsListener};
-pub use relay::NatTraversalServer;
+/// A dummy function to satisfy the compiler
+pub fn placeholder() -> &'static str {
+    "This is a placeholder library for the TagIO HTTP tunnel server"
+}
 
-// Client-only modules
-#[cfg(feature = "client")]
-pub mod gui;
-#[cfg(feature = "client")]
-pub mod screen_capture; 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        assert_eq!(2 + 2, 4);
+    }
+} 
