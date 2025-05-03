@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
+use rand::Rng;
 
 // Constants for protocol magic
 const PROTOCOL_MAGIC: &[u8] = b"TAGIO";
@@ -149,6 +150,39 @@ async fn get_client_by_id(tagio_id: u32) -> Option<ClientInfo> {
     CLIENT_REGISTRY.read().await.get(&tagio_id).cloned()
 }
 
+/// Generate a unique TagIO ID between 5000-9999 that's not already in use
+async fn generate_unique_tagio_id() -> u32 {
+    // Use a thread-safe random number generator for async contexts
+    let tagio_id = {
+        // Scope the RNG so it's dropped before the await points
+        let mut rng = rand::thread_rng();
+        rng.gen_range(5000..10000)
+    };
+    
+    // Check if the ID already exists in the registry
+    let registry = CLIENT_REGISTRY.read().await;
+    
+    // If the randomly generated ID already exists, find the next available one
+    let final_id = if registry.contains_key(&tagio_id) {
+        // Try sequential IDs until we find an unused one
+        let mut available_id = tagio_id;
+        for i in 0..5000 { // Maximum 5000 attempts (covers the entire range of 5000-9999)
+            let next_id = 5000 + ((tagio_id - 5000 + i) % 5000);
+            if !registry.contains_key(&next_id) {
+                available_id = next_id;
+                break;
+            }
+        }
+        available_id
+    } else {
+        tagio_id
+    };
+    
+    // Log the generated ID
+    info!("Generated unique TagIO ID: {}", final_id);
+    final_id
+}
+
 /// Handles HTTP POST requests containing TagIO protocol messages
 async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::HeaderMap>) -> Result<Response<Body>, hyper::http::Error> {
     if body_bytes.is_empty() {
@@ -199,28 +233,19 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                 let msg_type = String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]);
                 info!("TagIO message type: {}", msg_type);
                 
-                // If client sent PING message, we should send ACK
+                // If client sent PING message, we should send ACK with a unique ID
                 if msg_type.contains("PING") {
-                    info!("Received PING from client, sending ACK response");
+                    info!("Received PING from client, sending ACK response with assigned TagIO ID");
                     
-                    // Extract TagIO ID if included in the message (should be right after "PING")
-                    if body_bytes.len() >= msg_type_offset + 4 + 4 {  // 4 bytes for "PING" + 4 bytes for ID
-                        let id_offset = msg_type_offset + 4;
-                        let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
-                        if tagio_id_bytes.len() == 4 {
-                            let tagio_id = u32::from_le_bytes([
-                                tagio_id_bytes[0], tagio_id_bytes[1], 
-                                tagio_id_bytes[2], tagio_id_bytes[3]
-                            ]);
-                            
-                            // Update client activity
-                            update_client_timestamp(tagio_id).await;
-                        }
-                    }
+                    // Generate a unique TagIO ID
+                    let tagio_id = generate_unique_tagio_id().await;
                     
-                    // Create ACK response
-                    // Protocol format: TAGIO + protocol version (4 bytes) + "ACK" message
-                    let mut response = Vec::with_capacity(12);
+                    // Register this client in our registry
+                    register_client(tagio_id, client_ip).await;
+                    
+                    // Create ACK response with the TagIO ID
+                    // Protocol format: TAGIO + protocol version (4 bytes) + "ACK" message + TagIO ID (4 bytes)
+                    let mut response = Vec::with_capacity(16);
                     // Add TAGIO magic bytes
                     response.extend_from_slice(PROTOCOL_MAGIC);
                     // Add protocol version (same as received)
@@ -232,8 +257,10 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                     }
                     // Add ACK message
                     response.extend_from_slice(b"ACK");
+                    // Add TagIO ID in little-endian format
+                    response.extend_from_slice(&tagio_id.to_le_bytes());
                     
-                    debug!("Sending ACK response: {}", hex_dump(&response, response.len()));
+                    debug!("Sending ACK response with TagIO ID {}: {}", tagio_id, hex_dump(&response, response.len()));
                     
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -377,6 +404,18 @@ async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
             padding: 15px;
             margin: 20px 0;
         }}
+        .error {{
+            background-color: #ffebee;
+            border-left: 5px solid #f44336;
+            padding: 15px;
+            margin: 20px 0;
+        }}
+        code {{
+            background-color: #f5f5f5;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: monospace;
+        }}
     </style>
 </head>
 <body>
@@ -408,11 +447,33 @@ Protocol: TagIO over HTTP tunneling
         <p>You do NOT need to specify any special port in your client configuration.</p>
     </div>
     
+    <div class="error">
+        <h3>Troubleshooting Cloudflare 400 Bad Request Errors</h3>
+        <p>If your client is receiving 400 Bad Request errors from Cloudflare, ensure your HTTP request is properly formatted:</p>
+        <ul>
+            <li>Use a valid HTTP POST request with TagIO data in the body</li>
+            <li>Set <code>Content-Type: application/octet-stream</code> header</li>
+            <li>Set <code>Content-Length</code> header with the correct byte length</li>
+            <li>Include <code>X-TagIO-Protocol: true</code> header to help our server identify TagIO traffic</li>
+        </ul>
+        <p>Example HTTP request:</p>
+        <pre>
+POST / HTTP/1.1
+Host: tagio-server.onrender.com
+Content-Type: application/octet-stream
+Content-Length: [LENGTH]
+X-TagIO-Protocol: true
+
+[TAGIO BINARY DATA]
+</pre>
+    </div>
+    
     <h2>For Developers</h2>
     <p>TagIO clients should:</p>
     <ol>
         <li>Connect to this server via HTTPS (port 443)</li>
         <li>Send TagIO protocol messages in the body of POST requests</li>
+        <li>Include proper HTTP headers (especially Content-Type)</li>
         <li>Read responses from the HTTP response body</li>
         <li>Do not attempt to connect directly to internal port 10000</li>
     </ol>
