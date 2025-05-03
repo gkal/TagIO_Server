@@ -132,32 +132,82 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
                 }
             }
             
-            // Log the TagIO message type if available (after the magic bytes and protocol version)
-            if body_bytes.len() > PROTOCOL_MAGIC.len() + 4 {
-                let msg_type_offset = PROTOCOL_MAGIC.len() + 4; // Magic bytes + 4 bytes of protocol version
+            // Check for PING message after TAGIO magic bytes
+            // TAGIO protocol header is typically 9 bytes:
+            // - 5 bytes for "TAGIO" 
+            // - 4 bytes for protocol version (00 00 00 01)
+            if body_bytes.len() >= PROTOCOL_MAGIC.len() + 4 {
+                let msg_type_offset = PROTOCOL_MAGIC.len() + 4;
+                let msg_type_bytes = &body_bytes[msg_type_offset..];
                 
-                // Ensure we don't go out of bounds
-                if msg_type_offset < body_bytes.len() {
-                    let msg_type_bytes = &body_bytes[msg_type_offset..];
+                // Try to decode the message type as ASCII
+                let msg_type = String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]);
+                info!("TagIO message type: {}", msg_type);
+                
+                // If client sent PING message, we should send ACK
+                if msg_type.contains("PING") {
+                    info!("Received PING from client, sending ACK response");
                     
-                    // Try to decode the message type as ASCII
-                    let msg_type = String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]);
-                    info!("TagIO message type: {}", msg_type);
+                    // Create ACK response
+                    // Protocol format: TAGIO + protocol version (4 bytes) + "ACK" message
+                    let mut response = Vec::with_capacity(12);
+                    // Add TAGIO magic bytes
+                    response.extend_from_slice(PROTOCOL_MAGIC);
+                    // Add protocol version (same as received)
+                    if body_bytes.len() >= PROTOCOL_MAGIC.len() + 4 {
+                        response.extend_from_slice(&body_bytes[PROTOCOL_MAGIC.len()..PROTOCOL_MAGIC.len() + 4]);
+                    } else {
+                        // Default to version 1 if not provided
+                        response.extend_from_slice(&[0, 0, 0, 1]);
+                    }
+                    // Add ACK message
+                    response.extend_from_slice(b"ACK");
                     
-                    // Try to extract TagIO ID from the message if it contains "REGISTER"
-                    if msg_type.contains("REGISTER") && body_bytes.len() >= msg_type_offset + 8 {
-                        // TagIO ID is typically at offset 8 after the message type
+                    debug!("Sending ACK response: {}", hex_dump(&response, response.len()));
+                    
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/octet-stream")
+                        .header("X-TagIO-Raw-Protocol", "true")
+                        .body(Body::from(response))
+                        .unwrap());
+                }
+                // Add handling for REGISTER message with IP and TagIO ID
+                else if msg_type.contains("REGISTER") {
+                    info!("Received REGISTER from client with IP and TagIO ID");
+                    
+                    // Extract and log TagIO ID if included in the message
+                    if body_bytes.len() >= msg_type_offset + 8 + 4 {  // 8 bytes offset for REGISTER + 4 bytes for ID
                         let id_offset = msg_type_offset + 8;
-                        if body_bytes.len() >= id_offset + 4 {
-                            let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
-                            let tagio_id = u32::from_le_bytes([
-                                tagio_id_bytes[0], tagio_id_bytes[1], 
-                                tagio_id_bytes[2], tagio_id_bytes[3]
-                            ]);
-                            info!("Client registering with TagIO ID: {}", tagio_id);
+                        let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
+                        let tagio_id = u32::from_le_bytes([
+                            tagio_id_bytes[0], tagio_id_bytes[1], 
+                            tagio_id_bytes[2], tagio_id_bytes[3]
+                        ]);
+                        info!("Client registering with TagIO ID: {}", tagio_id);
+                        
+                        // For REGISTER message, respond with REG_ACK
+                        let mut response = Vec::with_capacity(16);
+                        // Add TAGIO magic bytes
+                        response.extend_from_slice(PROTOCOL_MAGIC);
+                        // Add protocol version (same as received)
+                        if body_bytes.len() >= PROTOCOL_MAGIC.len() + 4 {
+                            response.extend_from_slice(&body_bytes[PROTOCOL_MAGIC.len()..PROTOCOL_MAGIC.len() + 4]);
+                        } else {
+                            // Default to version 1 if not provided
+                            response.extend_from_slice(&[0, 0, 0, 1]);
                         }
-                    } else if msg_type.contains("PING") {
-                        info!("Received PING from client");
+                        // Add REG_ACK message
+                        response.extend_from_slice(b"REG_ACK");
+                        
+                        debug!("Sending REG_ACK response: {}", hex_dump(&response, response.len()));
+                        
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/octet-stream")
+                            .header("X-TagIO-Raw-Protocol", "true")
+                            .body(Body::from(response))
+                            .unwrap());
                     }
                 }
             }
@@ -169,13 +219,12 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::Hea
         warn!("Message too short ({} bytes) to contain TagIO protocol magic", body_bytes.len());
     }
 
-    // For TagIO protocol, the content type must be application/octet-stream
-    // and we must return the raw bytes WITHOUT any HTTP headers in the response body
-    debug!("Sending TagIO response with {} bytes", body_bytes.len());
-    debug!("Response hex dump: {}", hex_dump(&body_bytes, 64));
+    // If we get here and it's a valid TagIO message but not a recognized type,
+    // just echo back the original message
+    debug!("Sending generic response with {} bytes", body_bytes.len());
+    debug!("Generic response hex dump: {}", hex_dump(&body_bytes, 64));
 
     // IMPORTANT: Return raw bytes for TagIO protocol without HTTP wrapping
-    // This allows clients expecting raw TagIO protocol to work correctly
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
