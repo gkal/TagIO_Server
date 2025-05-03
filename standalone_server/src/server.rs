@@ -1246,9 +1246,6 @@ impl RelayServer {
         // Create a clone of the server for the TagIO protocol handler
         let server = self.clone();
         
-        // Create a client registry for HTTP tunneling
-        let client_registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        
         // Start the TagIO protocol handler
         let protocol_handler = tokio::spawn(async move {
             info!("Starting TagIO protocol handler for HTTP tunneling");
@@ -1283,16 +1280,12 @@ impl RelayServer {
         let addr = bind_addr.clone();
         
         // Create a modified version of handle_tagio_over_http that accepts our channel
-        let client_reg = client_registry.clone();
-        let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
+        let make_svc = make_service_fn(move |_conn| {
             let tagio_tx = tagio_tx.clone();
-            let registry = client_reg.clone();
-            let client_addr = conn.remote_addr();
             
-            async move {
+            async {
                 Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
                     let _tagio_tx = tagio_tx.clone();
-                    let registry = registry.clone();
                     
                     async move {
                         // Route the request
@@ -1301,14 +1294,14 @@ impl RelayServer {
                                 http_tunnel::serve_status_page().await
                             }
                             (_, "/tagio") => {
-                                // Pass the client registry and address to the handler
-                                http_tunnel::handle_tagio_over_http(req, registry.clone(), client_addr).await
+                                // Handle with standard function for now
+                                http_tunnel::handle_tagio_over_http(req).await
                             }
                             _ => {
-                                // Return 404 for any other path but with 200 OK status for compatibility
+                                // Return 404 for any other path
                                 Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Body::from("Not Found - The requested resource does not exist"))
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Body::from("Not Found"))
                                     .unwrap())
                             }
                         }
