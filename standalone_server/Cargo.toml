@@ -38,6 +38,13 @@ colored = "2.0.0"
 rand = "0.8.5"
 hyper = { version = "0.14", features = ["full"] }
 http = "0.2.9"
+# TLS support for HTTPS server
+rustls = "0.21.6"
+rustls-pemfile = "1.0.2"
+hyper-rustls = { version = "0.24.1", features = ["http1", "http2"] }
+tokio-rustls = "0.24.1"
+rcgen = "0.11.1"
+async-stream = "0.3.5"
 
 [[bin]]
 name = "tagio_relay_server"

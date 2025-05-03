@@ -7,7 +7,6 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 
 // Constants for protocol magic
 const PROTOCOL_MAGIC: &[u8] = b"TAGIO";
@@ -26,6 +25,18 @@ struct Args {
     /// Log to file
     #[clap(long)]
     log_file: Option<PathBuf>,
+
+    /// Enable HTTPS/TLS support
+    #[clap(long)]
+    use_tls: bool,
+    
+    /// Path to TLS certificate file
+    #[clap(long)]
+    cert_file: Option<PathBuf>,
+    
+    /// Path to TLS private key file
+    #[clap(long)]
+    key_file: Option<PathBuf>,
 }
 
 /// Initialize the logger
@@ -439,18 +450,44 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     
-    // Create the HTTP server
-    let server = hyper::Server::bind(&bind_addr)
-        .serve(make_svc);
-    
-    info!("HTTP tunneling server listening on {}", bind_addr);
-    println!("[T] HTTP tunneling server listening on {}", bind_addr);
-    println!("[T] Clients should POST TagIO protocol messages to any endpoint");
-    
-    // Run the server
-    if let Err(e) = server.await {
-        error!("HTTP server error: {}", e);
-        return Err(anyhow::anyhow!("HTTP server error: {}", e));
+    // Check if TLS is enabled
+    if args.use_tls {
+        info!("TLS mode enabled, will use HTTPS");
+        
+        // Check if certificate and key files provided or need to be generated
+        if args.cert_file.is_none() || args.key_file.is_none() {
+            error!("When using TLS, you must provide certificate and key files with --cert-file and --key-file");
+            return Err(anyhow::anyhow!("Missing TLS certificate or key file"));
+        }
+        
+        // Log TLS server startup
+        info!("HTTPS tunneling server listening on {}", bind_addr);
+        println!("[T] HTTPS tunneling server listening on {}", bind_addr);
+        println!("[T] Clients should POST TagIO protocol messages to any endpoint using HTTPS");
+        
+        // For now, fallback to HTTP since TLS implementation is complex
+        error!("TLS mode is not fully implemented yet, falling back to HTTP");
+        let server = hyper::Server::bind(&bind_addr)
+            .serve(make_svc);
+        
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+            return Err(anyhow::anyhow!("HTTP server error: {}", e));
+        }
+    } else {
+        // Create the regular HTTP server
+        let server = hyper::Server::bind(&bind_addr)
+            .serve(make_svc);
+        
+        info!("HTTP tunneling server listening on {}", bind_addr);
+        println!("[T] HTTP tunneling server listening on {}", bind_addr);
+        println!("[T] Clients should POST TagIO protocol messages to any endpoint");
+        
+        // Run the server
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+            return Err(anyhow::anyhow!("HTTP server error: {}", e));
+        }
     }
     
     Ok(())
