@@ -105,7 +105,7 @@ fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool {
 }
 
 /// Handles HTTP POST requests containing TagIO protocol messages
-async fn handle_tagio_over_http(body_bytes: Vec<u8>) -> Result<Response<Body>, hyper::http::Error> {
+async fn handle_tagio_over_http(body_bytes: Vec<u8>, headers: Option<&hyper::HeaderMap>) -> Result<Response<Body>, hyper::http::Error> {
     if body_bytes.is_empty() {
         error!("Received empty request body");
         return Ok(Response::builder()
@@ -123,6 +123,44 @@ async fn handle_tagio_over_http(body_bytes: Vec<u8>) -> Result<Response<Body>, h
         if magic_slice == PROTOCOL_MAGIC {
             info!("Valid TagIO protocol message received (magic: {})", 
                  String::from_utf8_lossy(magic_slice));
+            
+            // Add more detailed logging about the client connection
+            if let Some(headers) = headers {
+                if let Some(client_ip) = headers.get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok()) {
+                    info!("Client connecting from IP: {}", client_ip);
+                }
+            }
+            
+            // Log the TagIO message type if available (after the magic bytes and protocol version)
+            if body_bytes.len() > PROTOCOL_MAGIC.len() + 4 {
+                let msg_type_offset = PROTOCOL_MAGIC.len() + 4; // Magic bytes + 4 bytes of protocol version
+                
+                // Ensure we don't go out of bounds
+                if msg_type_offset < body_bytes.len() {
+                    let msg_type_bytes = &body_bytes[msg_type_offset..];
+                    
+                    // Try to decode the message type as ASCII
+                    let msg_type = String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]);
+                    info!("TagIO message type: {}", msg_type);
+                    
+                    // Try to extract TagIO ID from the message if it contains "REGISTER"
+                    if msg_type.contains("REGISTER") && body_bytes.len() >= msg_type_offset + 8 {
+                        // TagIO ID is typically at offset 8 after the message type
+                        let id_offset = msg_type_offset + 8;
+                        if body_bytes.len() >= id_offset + 4 {
+                            let tagio_id_bytes = &body_bytes[id_offset..id_offset + 4];
+                            let tagio_id = u32::from_le_bytes([
+                                tagio_id_bytes[0], tagio_id_bytes[1], 
+                                tagio_id_bytes[2], tagio_id_bytes[3]
+                            ]);
+                            info!("Client registering with TagIO ID: {}", tagio_id);
+                        }
+                    } else if msg_type.contains("PING") {
+                        info!("Received PING from client");
+                    }
+                }
+            }
         } else {
             warn!("Invalid protocol magic: {}", hex_dump(magic_slice, magic_slice.len()));
             warn!("Expected magic: {}", hex_dump(PROTOCOL_MAGIC, PROTOCOL_MAGIC.len()));
@@ -421,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
                         let actual_body = actual_body.to_vec();
                         info!("Processing TagIO protocol message of {} bytes", actual_body.len());
                         
-                        match handle_tagio_over_http(actual_body).await {
+                        match handle_tagio_over_http(actual_body, Some(&headers)).await {
                             Ok(response) => Ok::<_, hyper::http::Error>(response),
                             Err(e) => {
                                 error!("Error handling TagIO request: {}", e);
