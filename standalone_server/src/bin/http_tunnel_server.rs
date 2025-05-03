@@ -993,7 +993,7 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.2.1 =====");
+    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.0 =====");
     info!("TagIO HTTP Tunnel Server starting up with log level: {}", args.log_level);
 
     // Print protocol specification

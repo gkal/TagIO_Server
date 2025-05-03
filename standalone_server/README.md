@@ -1,19 +1,30 @@
-# TagIO Relay Server - Standalone Cloud Server
+# TagIO HTTP Tunnel Server - Standalone Version
 
 ## Purpose
 
-This is a standalone version of the TagIO relay server designed specifically for cloud deployment. It provides NAT traversal and relay services for TagIO clients.
+This standalone server provides HTTP tunneling and WebSocket capabilities for the TagIO protocol, enabling communication for clients behind firewalls or NAT devices.
+
+## Current Version: 0.3.0
+
+Recent improvements:
+- Refactored for better code organization
+- Enhanced WebSocket handling
+- Improved error management
+- Better protocol detection logic
+- Reduced code duplication with helper functions
 
 ## Features
 
-- **NAT Traversal**: Helps clients establish peer-to-peer connections through firewalls
-- **Relay Service**: Provides fallback data forwarding when direct connections aren't possible
-- **Cloud-Ready**: Optimized for deployment on cloud platforms like Render.com
-- **Protocol Security**: Uses protocol versioning and magic bytes for reliable connections
+- **HTTP Tunneling**: Allows sending TagIO protocol messages via HTTP POST requests
+- **WebSocket Support**: Enables real-time bidirectional communication
+- **TagIO Protocol**: Full support for the custom binary TagIO protocol
+- **Client Registry**: Tracks connected clients with unique IDs
+- **Cloud-Ready**: Optimized for deployment on platforms like Render.com
+- **Comprehensive Logging**: Detailed logging for operations and debugging
 
 ## Cloud Deployment
 
-The server is designed to be deployed to `tagio-server.onrender.com:443` for production use.
+The server is designed to be deployed to `tagio-server.onrender.com` for production use.
 
 ### Deployment to Render.com
 
@@ -21,8 +32,8 @@ The server is designed to be deployed to `tagio-server.onrender.com:443` for pro
 2. Connect your GitHub repository
 3. Configure as:
    - Build Command: `cargo build --release`
-   - Start Command: `./target/release/tagio_relay_server --bind 0.0.0.0:$PORT`
-   - Use environment variables for any custom configuration
+   - Start Command: `./target/release/http_tunnel_server`
+   - The server automatically uses the `PORT` environment variable
 
 ## Running Locally
 
@@ -33,25 +44,30 @@ cargo run --release
 Or with custom configuration:
 
 ```bash
-cargo run --release -- --bind 0.0.0.0:443 --public-ip [YOUR_PUBLIC_IP] --auth [SECRET]
+cargo run --release -- --port 8080 --log-level debug
 ```
 
 ## Configuration Options
 
-- `--bind`: Bind address (default: 0.0.0.0:443)
-- `--public-ip`: Public IP address for NAT traversal (auto-detected if not provided)
-- `--auth`: Authentication secret (uses default if not provided)
-- `--verbose`: Enable verbose logging
-- `--interactive`: Run with interactive setup prompts
+- `--port, -p`: Port to bind to (default: 10000)
+- `--log-level, -l`: Log level (trace, debug, info, warn, error)
+- `--log-file`: File to write logs to
+- `--use-tls`: Enable HTTPS/TLS support (experimental)
+- `--cert-file`: Path to TLS certificate file (for HTTPS)
+- `--key-file`: Path to TLS private key file (for HTTPS)
 
 ## Protocol Details
 
-This server implements the TagIO protocol (version 1) with the following features:
+This server implements the TagIO protocol with the following features:
 
-- Magic bytes validation (TAGIO)
-- Protocol version checking
-- Authenticated connections
-- Robust error handling
+- Magic bytes validation ("TAGIO")
+- Protocol version checking (4 bytes)
+- Message type identification
+- Client ID tracking (4-byte unique identifier)
+- Bidirectional communication
+- Automatic client registration
+
+TagIO clients are assigned unique IDs in the range 5000-9999.
 
 ## Building from Source
 
@@ -59,4 +75,8 @@ This server implements the TagIO protocol (version 1) with the following feature
 cargo build --release
 ```
 
-The executable will be available at `target/release/tagio_relay_server`. 
+The executable will be available at `target/release/http_tunnel_server`.
+
+## License
+
+All rights reserved. TagIO Team © 2025. 
