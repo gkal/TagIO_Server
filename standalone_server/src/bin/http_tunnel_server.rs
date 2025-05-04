@@ -942,8 +942,8 @@ async fn handle_ws_binary_message(
         response.extend_from_slice(&[0, 0, 0, 1]);
         
         if id_valid {
-            // Add REGLACK message
-            response.extend_from_slice(b"REGLACK");
+            // Add REGLACK message with distinctive padding to make it different size than ACK
+            response.extend_from_slice(b"REGLACK_CONFIRM");
             info!("Sending REGLACK response to client {}", client_ip);
         } else {
             // Add REGLERR message with error reason
@@ -958,8 +958,38 @@ async fn handle_ws_binary_message(
         info!("Response bytes: [{}]", bytes_str.join(", "));
         info!("Response as text: {}", String::from_utf8_lossy(&response));
 
+        // CRITICAL DEBUG: Log the pre-frame data
+        info!("WEBSOCKET RAW PRE-FRAME DATA: {} bytes will be sent:", response.len());
+        for (i, chunk) in response.chunks(8).enumerate() {
+            let chunk_hex: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
+            info!("   Bytes {}-{}: {}", i*8, i*8+chunk.len()-1, chunk_hex.join(" "));
+        }
+
         // Send response with flush to ensure immediate delivery
-        ws_sender.send(WsMessage::Binary(response.clone())).await?;
+        let send_result = ws_sender.send(WsMessage::Binary(response.clone())).await;
+        
+        // CRITICAL DEBUG: Log the actual WebSocket frame being sent
+        info!("WEBSOCKET FRAME SENT - RESULT: {:?}", send_result);
+        
+        // Flush to ensure immediate delivery
+        let flush_result = ws_sender.flush().await;
+        info!("WEBSOCKET FLUSH RESULT: {:?}", flush_result);
+        
+        // Send a follow-up check message with unique identifier
+        let follow_up = {
+            let mut follow_msg = Vec::with_capacity(32);
+            follow_msg.extend_from_slice(PROTOCOL_MAGIC);
+            follow_msg.extend_from_slice(&[0, 0, 0, 1]);
+            follow_msg.extend_from_slice(b"FOLLOWUP_VERIFICATION");
+            follow_msg
+        };
+        
+        // Add a short delay to separate messages
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        
+        info!("Sending FOLLOWUP verification message");
+        let follow_result = ws_sender.send(WsMessage::Binary(follow_up)).await;
+        info!("FOLLOWUP message result: {:?}", follow_result);
         ws_sender.flush().await?;
         
         info!("Successfully sent registration response to client {}", client_ip);
