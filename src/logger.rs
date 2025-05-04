@@ -6,7 +6,7 @@ pub fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(),
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[ T ] {} {} {}",
+                "[T] {} {} {}",
                 chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S"),
                 record.level(),
                 message

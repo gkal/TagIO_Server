@@ -70,7 +70,9 @@ Async Ecosystem
 - Use `sqlx` or `tokio-postgres` for async database interactions.
 - Utilize `tonic` for gRPC with async support.
 
-Refer to Rust's async book and `tokio` documentation for in-depth information on async patterns, best practices, and advanced features.
+- Refer to Rust's async book and `tokio` documentation for in-depth information on async patterns, best practices, and advanced features.
 
 
-use context7
+- use context7
+
+- after you read all the rules reply with only Ok Got it! 

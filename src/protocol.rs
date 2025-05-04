@@ -128,47 +128,49 @@ pub fn parse_message_type(data: &[u8]) -> MessageType {
 }
 
 /// Print out the TagIO protocol specification for debugging
-pub fn print_tagio_protocol_spec() {
-    println!("[ T ] ===== TAGIO WEBSOCKET PROTOCOL SPECIFICATION =====");
-    println!("[ T ] WebSocket clients must follow this binary protocol:");
-    println!("[ T ]");
-    println!("[ T ] 1. Message Format:");
-    println!("[ T ]    All messages start with: TAGIO + Version(4 bytes) + Message Type + [Payload]");
-    println!("[ T ]");
-    println!("[ T ] 2. To register with server:");
-    println!("[ T ]    a. Connect to WebSocket endpoint");
-    println!("[ T ]    b. Send any message to receive TagIO ID");
-    println!("[ T ]    c. Server will respond with ACK containing your TagIO ID");
-    println!("[ T ]    d. Client should confirm by sending REGL with REGISTER:<assigned_id>");
-    println!("[ T ]    e. Server will respond with REGLACK message");
-    println!("[ T ]");
-    println!("[ T ] 3. PING message format (client to server):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"PING\"");
-    println!("[ T ]    Binary: 54 41 47 49 4F 00 00 00 01 50 49 4E 47");
-    println!("[ T ]");
-    println!("[ T ] 4. ACK message format (server to client):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, big-endian)");
-    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
-    println!("[ T ]");
-    println!("[ T ] 5. REGL message format (client to server):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGL\" + \"REGISTER:<assigned_id>\"");
-    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 52 45 47 49 53 54 45 52 3A 37 38 39 30");
-    println!("[ T ]");
-    println!("[ T ] 6. REGLACK message format (server to client):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGLACK\"");
-    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 41 43 4B");
-    println!("[ T ]");
-    println!("[ T ] 7. REGLERR message format (server to client on error):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"REGLERR\" + [Error message]");
-    println!("[ T ]    Error types: ID_MISMATCH, INVALID_ID, MISSING_ID, MISSING_REGISTER, INVALID_FORMAT");
-    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 45 52 52 49 44 5F 4D 49 53 4D 41 54 43 48");
-    println!("[ T ]");
-    println!("[ T ] 8. MSG message format (bidirectional):");
-    println!("[ T ]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
-    println!("[ T ]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
-    println!("[ T ]");
-    println!("[ T ] Note: All messages must be sent as BINARY WebSocket frames, not text frames");
-    println!("[ T ] ===================================================");
+/// This function is no longer used in production but kept for reference
+#[allow(dead_code)]
+pub fn print_protocol_spec() {
+    println!("[T] ===== TAGIO WEBSOCKET PROTOCOL SPECIFICATION =====");
+    println!("[T] WebSocket clients must follow this binary protocol:");
+    println!("[T]");
+    println!("[T] 1. Message Format:");
+    println!("[T]    All messages start with: TAGIO + Version(4 bytes) + Message Type + [Payload]");
+    println!("[T]");
+    println!("[T] 2. To register with server:");
+    println!("[T]    a. Connect to WebSocket endpoint");
+    println!("[T]    b. Send any message to receive TagIO ID");
+    println!("[T]    c. Server will respond with ACK containing your TagIO ID");
+    println!("[T]    d. Client should confirm by sending REGL with REGISTER:<assigned_id>");
+    println!("[T]    e. Server will respond with REGLACK message");
+    println!("[T]");
+    println!("[T] 3. PING message format (client to server):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"PING\"");
+    println!("[T]    Binary: 54 41 47 49 4F 00 00 00 01 50 49 4E 47");
+    println!("[T]");
+    println!("[T] 4. ACK message format (server to client):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"ACK\" + TagIO ID (4 bytes, big-endian)");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 41 43 4B XX XX XX XX");
+    println!("[T]");
+    println!("[T] 5. REGL message format (client to server):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"REGL\" + \"REGISTER:<assigned_id>\"");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 52 45 47 49 53 54 45 52 3A 37 38 39 30");
+    println!("[T]");
+    println!("[T] 6. REGLACK message format (server to client):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"REGLACK\"");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 41 43 4B");
+    println!("[T]");
+    println!("[T] 7. REGLERR message format (server to client on error):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"REGLERR\" + [Error message]");
+    println!("[T]    Error types: ID_MISMATCH, INVALID_ID, MISSING_ID, MISSING_REGISTER, INVALID_FORMAT");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 52 45 47 4C 45 52 52 49 44 5F 4D 49 53 4D 41 54 43 48");
+    println!("[T]");
+    println!("[T] 8. MSG message format (bidirectional):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
+    println!("[T]");
+    println!("[T] Note: All messages must be sent as BINARY WebSocket frames, not text frames");
+    println!("[T] ===================================================");
 }
 
 /// Helper function to format bytes as a hex dump for logging

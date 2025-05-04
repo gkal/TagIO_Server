@@ -11,7 +11,7 @@ use std::str::FromStr;
 // Import our modularized code
 use tagio_workspace::client::cleanup_stale_clients;
 use tagio_workspace::logger::setup_logger;
-use tagio_workspace::protocol::{print_tagio_protocol_spec, find_tagio_magic};
+use tagio_workspace::protocol::find_tagio_magic;
 use tagio_workspace::http::{extract_tagio_from_http, serve_status_page, handle_tagio_over_http};
 // Use the non-immediate ACK WebSocket handler
 use tagio_workspace::websocket::handle_websocket_without_immediate_ack;
@@ -204,14 +204,11 @@ async fn main() -> anyhow::Result<()> {
     setup_logger(log_level, args.log_file.clone())?;
     
     // Print banner
-    println!("[ T ] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.3.2 =====");
-    println!("[ T ] Build timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-    info!("TagIO HTTP Tunnel Server v0.3.2 starting up with log level: {}", args.log_level);
-    info!("Fixed ACK message format and added REGL/REGLACK protocol support");
+    println!("[T] ===== STARTING TAGIO HTTP TUNNEL SERVER v0.4.0 =====");
+    println!("[T] Build timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    info!("TagIO HTTP Tunnel Server v0.4.0 starting up with log level: {}", args.log_level);
+    info!("Improved message formatting and protocol handling");
 
-    // Print protocol specification
-    print_tagio_protocol_spec();
-    
     // Check for PORT environment variable (for cloud platforms like Render)
     let port = match std::env::var("PORT") {
         Ok(val) => match val.parse::<u16>() {
@@ -272,8 +269,8 @@ async fn main() -> anyhow::Result<()> {
         .serve(make_svc);
     
     info!("HTTP tunneling server listening on {}", bind_addr);
-    println!("[ T ] HTTP tunneling server listening on {}", bind_addr);
-    println!("[ T ] Clients should POST TagIO protocol messages to any endpoint");
+    println!("[T] HTTP tunneling server listening on {}", bind_addr);
+    println!("[T] Clients should POST TagIO protocol messages to any endpoint");
     
     if let Err(e) = server.await {
         error!("Server error: {}", e);

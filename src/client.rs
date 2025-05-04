@@ -35,7 +35,7 @@ pub fn format_ip_for_log(ip: &str) -> String {
 /// Format a log message with client information
 pub fn log_msg(msg_type: &str, client_ip: &str, tagio_id: u32, message: &str) -> String {
     let formatted_ip = format_ip_for_log(client_ip);
-    format!("[{:^7}] [ID:{:08X}] [{}] {}", 
+    format!("[{:^8}] [ID:{:08X}] [{}] {}", 
            msg_type, 
            tagio_id, 
            formatted_ip,
