@@ -64,7 +64,7 @@ pub fn log_msg(msg_type: &str, client_ip: &str, tagio_id: u32, message: &str) ->
 fn is_incoming_message(msg_type: &str) -> bool {
     matches!(msg_type, 
         "WS-RECV" | "MSG-TYPE" | "WS-PING" | "WS-PONG" | "WS-CLOSE" | "WS-TEXT" |
-        "PING-IN" | "REGL-IN" | "MSG-IN"  | "TEXT-IN"
+        "PING-IN" | "REGL-IN" | "MSG-IN"  | "TEXT-IN" | "CONN-IN" | "CONN-REQ"
     )
 }
 
@@ -73,7 +73,8 @@ fn is_outgoing_message(msg_type: &str) -> bool {
     matches!(msg_type, 
         "WS-SENT" | "WS-ACK" | "PONG-OUT" |
         "ACK-OUT" | "PING-OUT" | "MSG-OUT" | "REGLACK" | 
-        "TX-ACK" | "TX-MSG" | "SENDING" | "ACK-SENT"
+        "TX-ACK" | "TX-MSG" | "SENDING" | "ACK-SENT" |
+        "CONN-OUT" | "CONN-SNT"
     )
 }
 
