@@ -5,8 +5,11 @@ use hyper_tungstenite::tungstenite::Message as WsMessage;
 use hyper_tungstenite::WebSocketStream;
 use std::net::SocketAddr;
 
-use crate::client::{register_client, update_client_timestamp, log_msg};
-use crate::protocol::{create_tagio_ack_response, create_tagio_reglack_response, hex_dump, PROTOCOL_MAGIC};
+use crate::client::{register_client, update_client_timestamp, log_msg, get_client_by_id};
+use crate::protocol::{
+    create_tagio_ack_response, create_tagio_reglack_response, create_tagio_reglerr_response,
+    create_tagio_conn_response, parse_conn_request, hex_dump, PROTOCOL_MAGIC
+};
 
 /// Handle WebSocket client registration and message exchange with immediate ACK
 pub async fn handle_websocket_with_immediate_ack(
@@ -288,6 +291,7 @@ pub async fn handle_ws_binary_message(
     // Check for common message types
     let is_regl = message_data.len() >= 4 && &message_data[0..4] == b"REGL";
     let is_ping = message_data.len() >= 4 && &message_data[0..4] == b"PING";
+    let is_conn = message_data.len() >= 4 && &message_data[0..4] == b"CONN";
     
     // Extract text representation for logging
     let msg_type_end = message_data.iter()
@@ -298,6 +302,56 @@ pub async fn handle_ws_binary_message(
     let msg_type = String::from_utf8_lossy(&message_data[..msg_type_end]).to_string();
     
     info!("{}", log_msg("MSG-TYPE", client_ip, tagio_id, &format!("Message type: {}", msg_type)));
+    
+    // Handle CONN message - lookup target client and respond with IP
+    if is_conn {
+        info!("{}", log_msg("CONN-IN", client_ip, tagio_id, "Received connection request"));
+        
+        // Parse the connection request to get the target TagIO ID
+        if let Some(target_id) = parse_conn_request(&data) {
+            info!("{}", log_msg("CONN-REQ", client_ip, tagio_id, &format!("Connection request for TagIO ID: {}", target_id)));
+            
+            // Look up the target client in the registry
+            match get_client_by_id(target_id).await {
+                Some(target_client) => {
+                    // Found the target client, create a response with their IP
+                    info!("{}", log_msg("CONN-FND", client_ip, tagio_id, 
+                        &format!("Found target client {} with IP: {}", target_id, target_client.ip_address)));
+                    
+                    // Create the connection response
+                    let response = create_tagio_conn_response(&target_client.ip_address);
+                    
+                    // Send the response
+                    info!("{}", log_msg("CONN-OUT", client_ip, tagio_id, 
+                        &format!("Sending connection info for target: {} at {}", target_id, target_client.ip_address)));
+                    
+                    ws_sender.send(WsMessage::Binary(response)).await?;
+                    ws_sender.flush().await?;
+                    
+                    info!("{}", log_msg("CONN-SNT", client_ip, tagio_id, "Successfully sent connection info"));
+                },
+                None => {
+                    // Target client not found, send error response
+                    info!("{}", log_msg("CONN-ERR", client_ip, tagio_id, 
+                        &format!("Target client {} not found", target_id)));
+                    
+                    // Create error response
+                    let error_msg = format!("TARGET_NOT_FOUND:{}", target_id);
+                    let response = create_tagio_reglerr_response(&error_msg);
+                    
+                    ws_sender.send(WsMessage::Binary(response)).await?;
+                    ws_sender.flush().await?;
+                    
+                    info!("{}", log_msg("ERRO-SNT", client_ip, tagio_id, 
+                        &format!("Sent error: Target {} not found", target_id)));
+                }
+            }
+            
+            return Ok(());
+        } else {
+            info!("{}", log_msg("CONN-INV", client_ip, tagio_id, "Invalid connection request format"));
+        }
+    }
     
     // Handle REGL message - THIS IS THE CRITICAL FIX FOR THE REGLACK ISSUE
     if is_regl {

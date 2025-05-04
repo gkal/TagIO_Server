@@ -11,6 +11,7 @@ pub enum MessageType {
     ReglAck,
     ReglErr,
     Msg,
+    Conn,
     Unknown
 }
 
@@ -23,6 +24,7 @@ impl fmt::Display for MessageType {
             MessageType::ReglAck => write!(f, "REGLACK"),
             MessageType::ReglErr => write!(f, "REGLERR"),
             MessageType::Msg => write!(f, "MSG"),
+            MessageType::Conn => write!(f, "CONN"),
             MessageType::Unknown => write!(f, "UNKNOWN"),
         }
     }
@@ -93,6 +95,65 @@ pub fn create_tagio_reglerr_response(error_msg: &str) -> Vec<u8> {
     response
 }
 
+/// Create a TagIO CONN response message containing the IP address of the target client
+pub fn create_tagio_conn_response(target_ip: &str) -> Vec<u8> {
+    // Create response with: TAGIO(5) + version(4) + "CONN"(4) + IP length(2) + IP address
+    let mut response = Vec::with_capacity(32);
+    
+    // Add TAGIO magic bytes
+    response.extend_from_slice(PROTOCOL_MAGIC); // 5 bytes: "TAGIO"
+    
+    // Use protocol version 1
+    response.extend_from_slice(&[0, 0, 0, 1]); // 4 bytes: version
+    
+    // Add CONN message
+    response.extend_from_slice(b"CONN"); // 4 bytes: "CONN"
+    
+    // Add IP address length as 2 bytes (big-endian u16)
+    let ip_len = target_ip.len() as u16;
+    response.extend_from_slice(&ip_len.to_be_bytes()); // 2 bytes: length
+    
+    // Add the IP address as a string
+    response.extend_from_slice(target_ip.as_bytes());
+    
+    debug!("Created CONN response with target IP: {}, length: {}", target_ip, ip_len);
+    
+    response
+}
+
+/// Parse a connection request message to extract the target TagIO ID
+pub fn parse_conn_request(data: &[u8]) -> Option<u32> {
+    // Check if this is a valid TagIO message
+    if data.len() < PROTOCOL_MAGIC.len() + 4 + 4 + 4 {
+        return None; // Too short for CONN request
+    }
+    
+    // Check for TagIO magic bytes
+    if &data[0..PROTOCOL_MAGIC.len()] != PROTOCOL_MAGIC {
+        return None;
+    }
+    
+    // Message type starts after TAGIO(5) + version(4)
+    let msg_type_offset = PROTOCOL_MAGIC.len() + 4;
+    let msg_type_data = &data[msg_type_offset..];
+    
+    // Check if this is a CONN message
+    if msg_type_data.len() < 4 || &msg_type_data[0..4] != b"CONN" {
+        return None;
+    }
+    
+    // Extract the target ID - it should be 4 bytes after "CONN"
+    if msg_type_data.len() < 8 {
+        return None; // Not enough data for the ID
+    }
+    
+    // The target ID is 4 bytes starting after "CONN"
+    let id_bytes = &msg_type_data[4..8];
+    
+    // Convert the 4 bytes to a u32
+    Some(u32::from_be_bytes([id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]))
+}
+
 /// Parse a TagIO message to identify its type
 pub fn parse_message_type(data: &[u8]) -> MessageType {
     // Ensure we have enough data to identify message type
@@ -122,6 +183,8 @@ pub fn parse_message_type(data: &[u8]) -> MessageType {
         MessageType::ReglErr
     } else if msg_type_data.len() >= 3 && &msg_type_data[0..3] == b"MSG" {
         MessageType::Msg
+    } else if msg_type_data.len() >= 4 && &msg_type_data[0..4] == b"CONN" {
+        MessageType::Conn
     } else {
         MessageType::Unknown
     }
@@ -173,6 +236,15 @@ pub fn print_protocol_spec() {
     println!("[T] 9. MSG message format (bidirectional):");
     println!("[T]    TAGIO + Version(00 00 00 01) + \"MSG\" + Target ID (4 bytes) + [Payload]");
     println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 4D 53 47 XX XX XX XX [payload data]");
+    println!("[T]");
+    println!("[T] 10. CONN message format (client to server):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"CONN\" + Target ID (4 bytes)");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 43 4F 4E 4E XX XX XX XX");
+    println!("[T]");
+    println!("[T] 11. CONN response format (server to client):");
+    println!("[T]    TAGIO + Version(00 00 00 01) + \"CONN\" + IP Length (2 bytes) + [IP Address]");
+    println!("[T]    Example: 54 41 47 49 4F 00 00 00 01 43 4F 4E 4E 00 0B 31 39 32 2E 31 36 38 2E 31 2E 31");
+    println!("[T]    In the example, 00 0B indicates the IP address is 11 bytes long (\"192.168.1.1\")");
     println!("[T]");
     println!("[T] Note: All messages must be sent as BINARY WebSocket frames, not text frames");
     println!("[T] ===================================================");

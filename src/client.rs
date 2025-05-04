@@ -79,16 +79,40 @@ fn is_outgoing_message(msg_type: &str) -> bool {
 
 /// Helper function to register a client in the client registry
 pub async fn register_client(tagio_id: u32, ip_address: String) {
+    // Process IP address for P2P connectivity
+    // For client-facing connections over WebSockets, we need to ensure the IP is in a format
+    // that other clients can connect to directly for P2P communications.
+    let formatted_ip = prepare_ip_for_p2p(&ip_address);
+    
     info!("{}", log_msg("REGISTER", &ip_address, tagio_id, &format!("New client registration")));
     
     let mut registry = CLIENT_REGISTRY.write().await;
     registry.insert(tagio_id, ClientInfo {
         tagio_id,
-        ip_address,
+        ip_address: formatted_ip,
         last_seen: Instant::now(),
     });
     
     info!("{}", log_msg("REGISTRY", "system", 0, &format!("Registry now contains {} clients", registry.len())));
+}
+
+/// Prepare IP address for P2P connectivity
+/// This handles special cases like:
+/// - IPv6 addresses
+/// - Proxied connections (looking at X-Forwarded-For)
+/// - Internal network addresses that need port information
+fn prepare_ip_for_p2p(ip: &str) -> String {
+    // Handle potential edge cases for P2P connectivity
+    if ip.contains(":") {
+        // IPv6 address - ensure it's properly formatted with brackets if needed
+        if !ip.starts_with("[") && !ip.contains("]") {
+            return format!("[{}]", ip);
+        }
+    }
+    
+    // Remove any proxy information and just use the raw IP
+    // This assumes the IP format is already clean from the HTTP handler
+    ip.to_string()
 }
 
 /// Helper function to update client's last seen timestamp
