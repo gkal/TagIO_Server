@@ -294,7 +294,7 @@ pub async fn handle_ws_binary_message(
     
     // Handle REGL message - THIS IS THE CRITICAL FIX FOR THE REGLACK ISSUE
     if is_regl {
-        info!("{}", log_msg("REGL", client_ip, tagio_id, "Processing registration message"));
+        info!("{}", log_msg("REGL-IN", client_ip, tagio_id, "Processing registration message"));
         
         // REGL message validation omitted for brevity - would check for valid ID format
         let _id_valid = true; // Simplified for example
@@ -302,12 +302,12 @@ pub async fn handle_ws_binary_message(
         // Create REGLACK response
         let response = create_tagio_reglack_response();
         
-        info!("{}", log_msg("SENDING", client_ip, tagio_id, "REGLACK response"));
-        debug!("{}", log_msg("TX-DUMP", client_ip, tagio_id, &format!("Response hex: {}", hex_dump(&response, response.len()))));
+        info!("{}", log_msg("REGLACK", client_ip, tagio_id, "Sending REGLACK response"));
+        debug!("{}", log_msg("MSG-OUT", client_ip, tagio_id, &format!("Response hex: {}", hex_dump(&response, response.len()))));
         
         // Log the exact bytes for debugging
         let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-        info!("{}", log_msg("TX-BYTES", client_ip, tagio_id, &format!("[{}]", bytes_str.join(", "))));
+        debug!("{}", log_msg("MSG-OUT", client_ip, tagio_id, &format!("[{}]", bytes_str.join(", "))));
         
         // Ensure clean send
         ws_sender.flush().await?;
@@ -319,21 +319,21 @@ pub async fn handle_ws_binary_message(
         // CRITICAL: Return immediately without sending any ACK
         return Ok(());
     } else if is_ping {
-        info!("{}", log_msg("PING", client_ip, tagio_id, "Handling PING message"));
+        info!("{}", log_msg("PING-IN", client_ip, tagio_id, "Handling PING message"));
     } else {
-        info!("{}", log_msg("OTHER", client_ip, tagio_id, &format!("Handling non-registration message: {}", msg_type)));
+        info!("{}", log_msg("MSG-IN", client_ip, tagio_id, &format!("Handling message type: {}", msg_type)));
     }
     
     // Standard ACK response for non-REGL messages
     let response = create_tagio_ack_response(tagio_id);
     
-    info!("{}", log_msg("SENDING", client_ip, tagio_id, &format!("Standard ACK response with ID {}", tagio_id)));
-    debug!("{}", log_msg("ACK-DUMP", client_ip, tagio_id, &format!("ACK hex: {}", hex_dump(&response, response.len()))));
+    info!("{}", log_msg("ACK-OUT", client_ip, tagio_id, &format!("Sending ACK response with ID {}", tagio_id)));
+    debug!("{}", log_msg("MSG-OUT", client_ip, tagio_id, &format!("ACK hex: {}", hex_dump(&response, response.len()))));
     
     ws_sender.send(WsMessage::Binary(response)).await?;
     ws_sender.flush().await?;
     
-    info!("{}", log_msg("ACK-SENT", client_ip, tagio_id, "Successfully sent ACK response"));
+    info!("{}", log_msg("WS-SENT", client_ip, tagio_id, "Successfully sent ACK response"));
     info!("{}", log_msg("COMPLETE", client_ip, tagio_id, &format!("Processed {} byte TagIO message", data.len())));
     
     Ok(())
@@ -346,33 +346,33 @@ pub async fn handle_ws_text_message(
     client_ip: &str, 
     ws_sender: &mut futures::stream::SplitSink<WebSocketStream<Upgraded>, WsMessage>
 ) -> Result<(), anyhow::Error> {
-    info!("{}", log_msg("WS-TEXT", client_ip, tagio_id, &format!("Text message: {}", text)));
+    info!("{}", log_msg("TEXT-IN", client_ip, tagio_id, &format!("Text message: {}", text)));
     
     // Check for registration in text message
     if text.contains("REGL") || text.contains("REGISTER") {
-        info!("{}", log_msg("TEXT-REGL", client_ip, tagio_id, "Detected registration in text message"));
+        info!("{}", log_msg("REGL-IN", client_ip, tagio_id, "Detected registration in text message"));
         
         // Create REGLACK response
         let response = create_tagio_reglack_response();
         
-        info!("{}", log_msg("TX-REGLACK", client_ip, tagio_id, "Sending REGLACK for text registration"));
+        info!("{}", log_msg("REGLACK", client_ip, tagio_id, "Sending REGLACK for text registration"));
         
         ws_sender.send(WsMessage::Binary(response)).await?;
         ws_sender.flush().await?;
         
-        info!("{}", log_msg("TX-DONE", client_ip, tagio_id, "Successfully sent REGLACK"));
+        info!("{}", log_msg("WS-SENT", client_ip, tagio_id, "Successfully sent REGLACK"));
         return Ok(());
     }
     
     // For regular text messages, send ACK
     let response = create_tagio_ack_response(tagio_id);
     
-    info!("{}", log_msg("TX-ACK", client_ip, tagio_id, &format!("Sending ACK with ID: {}", tagio_id)));
+    info!("{}", log_msg("ACK-OUT", client_ip, tagio_id, &format!("Sending ACK with ID: {}", tagio_id)));
     
     ws_sender.send(WsMessage::Binary(response)).await?;
     ws_sender.flush().await?;
     
-    info!("{}", log_msg("TX-DONE", client_ip, tagio_id, "Successfully sent ACK response"));
+    info!("{}", log_msg("WS-SENT", client_ip, tagio_id, "Successfully sent ACK response"));
     
     Ok(())
 } 

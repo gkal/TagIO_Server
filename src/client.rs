@@ -20,26 +20,61 @@ lazy_static::lazy_static! {
 
 /// Format an IP address string for consistent log display
 pub fn format_ip_for_log(ip: &str) -> String {
-    // Truncate long IPs and format for consistent width
-    if ip.len() > 15 {
-        // If it's a long IPv6 or other format, truncate
-        format!("{}..{}", &ip[0..6], &ip[ip.len()-4..])
-    } else if ip == "unknown" {
-        "UNK".to_string()
+    // Ensure consistent width for IP addresses in logs
+    if ip == "unknown" {
+        return "unknown    ".to_string();
+    } else if ip == "system" {
+        return "system     ".to_string();
+    }
+    
+    // For normal IPs, ensure they're properly padded/truncated for consistent width
+    // Target width is 12 characters to accommodate most IPv4 addresses
+    let ip_len = ip.len();
+    if ip_len <= 12 {
+        // Pad shorter IPs with spaces
+        format!("{:<12}", ip)
     } else {
-        // For IPv4, just return as is up to 15 chars
-        ip[0..ip.len().min(15)].to_string()
+        // For longer IPs (like IPv6), truncate with indicator
+        format!("{}..{:<5}", &ip[0..4], &ip[ip_len-5..])
     }
 }
 
 /// Format a log message with client information
 pub fn log_msg(msg_type: &str, client_ip: &str, tagio_id: u32, message: &str) -> String {
     let formatted_ip = format_ip_for_log(client_ip);
-    format!("[{:^8}] [ID:{:08X}] [{}] {}", 
+    
+    // Add direction indicators for clarity
+    let direction_prefix = if is_incoming_message(msg_type) {
+        "← "
+    } else if is_outgoing_message(msg_type) {
+        "→ "
+    } else {
+        "  "
+    };
+    
+    format!("[{:^8}] [ID:{:08X}] [{}] {}{}", 
            msg_type, 
            tagio_id, 
            formatted_ip,
+           direction_prefix,
            message)
+}
+
+/// Determine if a message type represents incoming traffic
+fn is_incoming_message(msg_type: &str) -> bool {
+    matches!(msg_type, 
+        "WS-RECV" | "MSG-TYPE" | "WS-PING" | "WS-PONG" | "WS-CLOSE" | "WS-TEXT" |
+        "PING-IN" | "REGL-IN" | "MSG-IN"  | "TEXT-IN"
+    )
+}
+
+/// Determine if a message type represents outgoing traffic
+fn is_outgoing_message(msg_type: &str) -> bool {
+    matches!(msg_type, 
+        "WS-SENT" | "WS-ACK" | "PONG-OUT" |
+        "ACK-OUT" | "PING-OUT" | "MSG-OUT" | "REGLACK" | 
+        "TX-ACK" | "TX-MSG" | "SENDING" | "ACK-SENT"
+    )
 }
 
 /// Helper function to register a client in the client registry
