@@ -820,70 +820,114 @@ async fn handle_ws_binary_message(
         false
     };
     
-    // Extract the message type if possible
-    let msg_type = if has_tagio_magic && data.len() >= PROTOCOL_MAGIC.len() + 4 + 3 { 
-        let magic_pos = find_tagio_magic(&data).unwrap_or(0);
-        let msg_type_offset = magic_pos + PROTOCOL_MAGIC.len() + 4;
-        
-        if msg_type_offset < data.len() {
-            let msg_type_bytes = &data[msg_type_offset..];
-            String::from_utf8_lossy(&msg_type_bytes[..std::cmp::min(msg_type_bytes.len(), 10)]).to_string()
-        } else {
-            "UNKNOWN".to_string()
-        }
-    } else {
-        "UNKNOWN".to_string()
-    };
+    if !has_tagio_magic {
+        info!("Message doesn't contain TagIO magic bytes, ignoring");
+        return Ok(());
+    }
+    
+    // Find the position of the TagIO magic bytes
+    let magic_pos = find_tagio_magic(&data).unwrap_or(0);
+    
+    // Make sure we have enough data for protocol header
+    if data.len() < magic_pos + PROTOCOL_MAGIC.len() + 4 {
+        info!("Message too short for TagIO protocol header");
+        return Ok(());
+    }
+    
+    // Extract protocol version (4 bytes after magic)
+    let version_offset = magic_pos + PROTOCOL_MAGIC.len();
+    let version_bytes = &data[version_offset..version_offset + 4];
+    let version = u32::from_be_bytes([
+        version_bytes[0], version_bytes[1],
+        version_bytes[2], version_bytes[3]
+    ]);
+    
+    info!("TagIO protocol version: {}", version);
+    
+    // Extract message type - starts after version (9 bytes from magic start)
+    let msg_type_offset = version_offset + 4;
+    
+    if data.len() <= msg_type_offset {
+        info!("Message too short for message type");
+        return Ok(());
+    }
+    
+    // Get raw message data after the header for easier processing
+    let message_data = &data[msg_type_offset..];
+    
+    // Try to extract the message type from the message data
+    let msg_type_end = message_data.iter()
+        .take(10) // Look at first 10 bytes max
+        .position(|&b| !b.is_ascii_uppercase() && !b.is_ascii_digit()) // Stop at first non-uppercase, non-digit char
+        .unwrap_or(4.min(message_data.len()));
+    
+    let msg_type = String::from_utf8_lossy(&message_data[..msg_type_end]).to_string();
     
     info!("TagIO message type via WebSocket from {}: {}", client_ip, msg_type);
     
     // Handle REGL message specifically
-    if msg_type.contains("REGL") {
+    if msg_type == "REGL" {
         info!("Received REGL message from client {}, handling registration confirmation", client_ip);
         info!("Raw REGL message: {}", hex_dump(&data, data.len()));
         
         // Log the message as text if possible
-        info!("REGL message as text: {}", String::from_utf8_lossy(&data));
+        let msg_text = String::from_utf8_lossy(&data);
+        info!("REGL message as text: {}", msg_text);
         
         // Track if we successfully extracted a valid ID
         let mut id_valid = false;
         let mut error_msg = "INVALID_FORMAT";
         
-        // Extract client ID if included in REGISTER message
-        if let Some(register_info) = msg_type.find("REGISTER:") {
-            info!("Found REGISTER: marker at position {}", register_info);
-            if register_info + 9 < msg_type.len() {
-                let id_str = &msg_type[register_info + 9..];
-                info!("Extracted ID string: '{}'", id_str);
-                match id_str.parse::<u32>() {
-                    Ok(client_provided_id) => {
-                        info!("Successfully parsed client provided TagIO ID: {}", client_provided_id);
-                        
-                        // Verify that the client is using the same ID we assigned
-                        if client_provided_id == tagio_id {
-                            info!("Client confirmed the correct TagIO ID: {}", tagio_id);
-                            id_valid = true;
-                        } else {
-                            error_msg = "ID_MISMATCH";
-                            warn!("Client provided TagIO ID {} doesn't match the assigned ID {}", 
-                                  client_provided_id, tagio_id);
+        // The registration data should start after the "REGL" message type
+        let register_data_offset = msg_type_offset + msg_type.len();
+        
+        if register_data_offset < data.len() {
+            // Get everything after the REGL message type
+            let register_data = &data[register_data_offset..];
+            let register_text = String::from_utf8_lossy(register_data);
+            
+            info!("Registration data: '{}'", register_text);
+            
+            // Check if it contains the REGISTER: prefix
+            if register_text.contains("REGISTER:") {
+                let register_prefix_pos = register_text.find("REGISTER:").unwrap();
+                let id_start = register_prefix_pos + "REGISTER:".len();
+                
+                if id_start < register_text.len() {
+                    let id_str = &register_text[id_start..];
+                    let id_str = id_str.trim_end_matches(|c| !char::is_ascii_digit(&c));
+                    
+                    info!("Extracted ID string: '{}'", id_str);
+                    match id_str.parse::<u32>() {
+                        Ok(client_provided_id) => {
+                            info!("Successfully parsed client provided TagIO ID: {}", client_provided_id);
+                            
+                            // Verify that the client is using the same ID we assigned
+                            if client_provided_id == tagio_id {
+                                info!("Client confirmed the correct TagIO ID: {}", tagio_id);
+                                id_valid = true;
+                            } else {
+                                error_msg = "ID_MISMATCH";
+                                warn!("Client provided TagIO ID {} doesn't match the assigned ID {}", 
+                                    client_provided_id, tagio_id);
+                            }
+                            
+                            // Register or update this client with their provided ID
+                            register_client(client_provided_id, client_ip.to_string()).await;
+                        },
+                        Err(e) => {
+                            error_msg = "INVALID_ID";
+                            error!("Failed to parse TagIO ID '{}' from REGISTER message: {}", id_str, e);
                         }
-                        
-                        // Register or update this client with their provided ID
-                        register_client(client_provided_id, client_ip.to_string()).await;
-                    },
-                    Err(e) => {
-                        error_msg = "INVALID_ID";
-                        error!("Failed to parse TagIO ID '{}' from REGISTER message: {}", id_str, e);
                     }
+                } else {
+                    error_msg = "MISSING_ID";
+                    error!("REGISTER message format invalid, missing ID value after 'REGISTER:'");
                 }
             } else {
-                error_msg = "MISSING_ID";
-                error!("REGISTER message format invalid, missing ID value after 'REGISTER:'");
+                error_msg = "MISSING_REGISTER";
+                error!("REGL message doesn't contain REGISTER instruction");
             }
-        } else {
-            error_msg = "MISSING_REGISTER";
-            error!("REGL message doesn't contain REGISTER instruction");
         }
         
         // Create appropriate response based on validation result
@@ -930,7 +974,6 @@ async fn handle_ws_binary_message(
     let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
     info!("ACK response bytes: [{}]", bytes_str.join(", "));
 
-    // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
     // Send the response via WebSocket, wrapped in a binary frame
     if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
         error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
@@ -939,10 +982,8 @@ async fn handle_ws_binary_message(
         info!("Successfully sent ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
     }
     
-    // Only do additional protocol processing if we detected TagIO data
-    if has_tagio_magic {
-        info!("Received TagIO protocol message of {} bytes via WebSocket from {}", data.len(), client_ip);
-    }
+    // Log that we processed a TagIO protocol message
+    info!("Received TagIO protocol message of {} bytes via WebSocket from {}", data.len(), client_ip);
     
     Ok(())
 }

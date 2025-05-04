@@ -1,9 +1,17 @@
-git status
-git add .
-
-@echo off
 :: Use %* to capture the entire command line
 set "commit_msg=%*"
+
+:: Check if commit message is empty
+if "%commit_msg%"=="" (
+    echo.
+    echo No commit message provided. Usage: git_commit.bat "Your commit message here"
+    echo.
+    exit /b 1
+)
+
+:: Show status and add files
+git status
+git add .
 
 :: Display the message for verification
 echo.
