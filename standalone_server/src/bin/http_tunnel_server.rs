@@ -865,6 +865,10 @@ async fn handle_ws_binary_message(
     
     info!("TagIO message type via WebSocket from {}: {}", client_ip, msg_type);
     
+    // CRITICAL: Create a flag to track if we've sent a response
+    // This prevents double responses for the same message
+    let mut response_sent = false;
+    
     // Handle REGL message specifically
     if msg_type == "REGL" {
         info!("Received REGL message from client {}, handling registration confirmation", client_ip);
@@ -954,32 +958,36 @@ async fn handle_ws_binary_message(
         info!("Response bytes: [{}]", bytes_str.join(", "));
         info!("Response as text: {}", String::from_utf8_lossy(&response));
 
-        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
-            error!("Error sending registration response to {}: {}", client_ip, e);
-            return Err(anyhow::anyhow!("Failed to send registration response: {}", e));
-        } else {
-            info!("Successfully sent registration response to client {}", client_ip);
-            return Ok(());
-        }
+        // Send response with flush to ensure immediate delivery
+        ws_sender.send(WsMessage::Binary(response.clone())).await?;
+        ws_sender.flush().await?;
+        
+        info!("Successfully sent registration response to client {}", client_ip);
+        
+        // Mark that we've sent a response, to avoid sending ACK
+        response_sent = true;
     }
     
-    // For other message types, send the standard ACK response
-    let response = create_tagio_ack_response(tagio_id);
-    
-    info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-    info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-    info!("ACK response contents: {} bytes: {:?}", response.len(), response);
+    // Only send a generic ACK if we haven't already sent a specific response
+    if !response_sent {
+        // For other message types, send the standard ACK response
+        let response = create_tagio_ack_response(tagio_id);
+        
+        info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
+        info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
+        info!("ACK response contents: {} bytes: {:?}", response.len(), response);
 
-    // Log each byte for debugging
-    let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-    info!("ACK response bytes: [{}]", bytes_str.join(", "));
+        // Log each byte for debugging
+        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+        info!("ACK response bytes: [{}]", bytes_str.join(", "));
 
-    // Send the response via WebSocket, wrapped in a binary frame
-    if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
-        error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
-        return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
-    } else {
-        info!("Successfully sent ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        // Send the response via WebSocket, wrapped in a binary frame
+        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
+            error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
+            return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
+        } else {
+            info!("Successfully sent ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        }
     }
     
     // Log that we processed a TagIO protocol message
