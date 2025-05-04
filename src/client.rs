@@ -24,7 +24,7 @@ pub fn format_ip_for_log(ip: &str) -> String {
     if ip == "unknown" {
         return "unknown    ".to_string();
     } else if ip == "system" {
-        return "system     ".to_string();
+        return "system      ".to_string();
     }
     
     // For normal IPs, ensure they're properly padded/truncated for consistent width

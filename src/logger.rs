@@ -5,10 +5,16 @@ use std::path::PathBuf;
 pub fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fern::InitError> {
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
+            // Format level - trim ERROR to ERRO
+            let level_str = match record.level() {
+                log::Level::Error => "ERRO".to_string(),
+                _ => record.level().to_string()
+            };
+            
             out.finish(format_args!(
                 "[T] {} {} {}",
                 chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S"),
-                record.level(),
+                level_str,
                 message
             ))
         })
