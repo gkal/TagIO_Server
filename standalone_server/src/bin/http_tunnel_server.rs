@@ -66,10 +66,9 @@ fn setup_logger(level: LevelFilter, log_file: Option<PathBuf>) -> Result<(), fer
     let mut builder = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[ T ] {} {} [{}] {}",
+                "[ T ] {} {} {}",
                 chrono::Local::now().format("%a %d/%m/%Y %H:%M:%S"),
                 record.level(),
-                record.target(),
                 message
             ))
         })
@@ -105,6 +104,20 @@ fn hex_dump(bytes: &[u8], max_len: usize) -> String {
     }
 }
 
+/// Format an IP address string for consistent log display
+fn format_ip_for_log(ip: &str) -> String {
+    // Truncate long IPs and format for consistent width
+    if ip.len() > 15 {
+        // If it's a long IPv6 or other format, truncate
+        format!("{}..{}", &ip[0..6], &ip[ip.len()-4..])
+    } else if ip == "unknown" {
+        "UNK".to_string()
+    } else {
+        // For IPv4, just return as is up to 15 chars
+        ip[0..ip.len().min(15)].to_string()
+    }
+}
+
 /// Extract TagIO protocol data from HTTP headers and body
 fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool {
     // Check for TagIO protocol indicators in headers
@@ -120,15 +133,25 @@ fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool {
     
     // Check for TagIO magic in body
     let has_tagio_magic = body.len() >= PROTOCOL_MAGIC.len() && 
-                          &body[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC;
+                       &body[0..PROTOCOL_MAGIC.len()] == PROTOCOL_MAGIC;
     
     // Return true if any of the TagIO indicators are present
     has_tagio_header || has_tagio_upgrade || has_tagio_content || has_tagio_magic
 }
 
+/// Format a log message with client information
+fn log_msg(msg_type: &str, client_ip: &str, tagio_id: u32, message: &str) -> String {
+    let formatted_ip = format_ip_for_log(client_ip);
+    format!("[{:^8}] [ID:{:08X}] [{}] {}", 
+           msg_type, 
+           tagio_id, 
+           formatted_ip,
+           message)
+}
+
 /// Helper function to register a client in the client registry
 async fn register_client(tagio_id: u32, ip_address: String) {
-    info!("Registering client with TagIO ID: {} from IP: {}", tagio_id, ip_address);
+    info!("{}", log_msg("REGISTER", &ip_address, tagio_id, &format!("New client registration")));
     
     let mut registry = CLIENT_REGISTRY.write().await;
     registry.insert(tagio_id, ClientInfo {
@@ -137,14 +160,14 @@ async fn register_client(tagio_id: u32, ip_address: String) {
         last_seen: Instant::now(),
     });
     
-    info!("Client registry now contains {} clients", registry.len());
+    info!("{}", log_msg("REGISTRY", "system", 0, &format!("Registry now contains {} clients", registry.len())));
 }
 
 /// Helper function to update client's last seen timestamp
 async fn update_client_timestamp(tagio_id: u32) {
     if let Some(client) = CLIENT_REGISTRY.write().await.get_mut(&tagio_id) {
         client.last_seen = Instant::now();
-        debug!("Updated last seen timestamp for client {}", tagio_id);
+        debug!("{}", log_msg("ACTIVITY", &client.ip_address, tagio_id, "Updated last seen timestamp"));
     }
 }
 
@@ -805,8 +828,8 @@ async fn handle_ws_binary_message(
     client_ip: &str, 
     ws_sender: &mut futures::stream::SplitSink<WebSocketStream<hyper::upgrade::Upgraded>, WsMessage>
 ) -> Result<(), anyhow::Error> {
-    info!("Received binary WebSocket message with {} bytes from {}", data.len(), client_ip);
-    info!("Binary message hex dump: {}", hex_dump(&data, data.len().min(100)));
+    info!("{}", log_msg("WS-RECV", client_ip, tagio_id, &format!("Binary message: {} bytes", data.len())));
+    debug!("{}", log_msg("WS-DUMP", client_ip, tagio_id, &format!("Hex dump: {}", hex_dump(&data, data.len().min(100)))));
     
     // Check if the data is a valid TagIO protocol message
     let has_tagio_magic = if data.len() >= PROTOCOL_MAGIC.len() {
@@ -821,7 +844,7 @@ async fn handle_ws_binary_message(
     };
     
     if !has_tagio_magic {
-        info!("Message doesn't contain TagIO magic bytes, ignoring");
+        info!("{}", log_msg("INVALID", client_ip, tagio_id, "Message doesn't contain TagIO magic bytes"));
         return Ok(());
     }
     
@@ -830,7 +853,7 @@ async fn handle_ws_binary_message(
     
     // Make sure we have enough data for protocol header
     if data.len() < magic_pos + PROTOCOL_MAGIC.len() + 4 {
-        info!("Message too short for TagIO protocol header");
+        info!("{}", log_msg("INVALID", client_ip, tagio_id, "Message too short for TagIO protocol header"));
         return Ok(());
     }
     
@@ -842,20 +865,36 @@ async fn handle_ws_binary_message(
         version_bytes[2], version_bytes[3]
     ]);
     
-    info!("TagIO protocol version: {}", version);
+    debug!("{}", log_msg("PROTOCOL", client_ip, tagio_id, &format!("TagIO protocol version: {}", version)));
     
     // Extract message type - starts after version (9 bytes from magic start)
     let msg_type_offset = version_offset + 4;
     
     if data.len() <= msg_type_offset {
-        info!("Message too short for message type");
+        info!("{}", log_msg("INVALID", client_ip, tagio_id, "Message too short for message type"));
         return Ok(());
     }
     
     // Get raw message data after the header for easier processing
     let message_data = &data[msg_type_offset..];
     
-    // Try to extract the message type from the message data
+    // Try to extract the message type from the message data using a more robust approach
+    // First check for common message types by direct comparison
+    let is_regl = if message_data.len() >= 4 && &message_data[0..4] == b"REGL" {
+        info!("{}", log_msg("MSG-DETECT", client_ip, tagio_id, "Detected REGL message type"));
+        true
+    } else {
+        false
+    };
+    
+    let is_ping = if message_data.len() >= 4 && &message_data[0..4] == b"PING" {
+        debug!("{}", log_msg("MSG-DETECT", client_ip, tagio_id, "Detected PING message type"));
+        true
+    } else {
+        false
+    };
+    
+    // Also extract text representation for logging and further processing
     let msg_type_end = message_data.iter()
         .take(10) // Look at first 10 bytes max
         .position(|&b| !b.is_ascii_uppercase() && !b.is_ascii_digit()) // Stop at first non-uppercase, non-digit char
@@ -863,34 +902,30 @@ async fn handle_ws_binary_message(
     
     let msg_type = String::from_utf8_lossy(&message_data[..msg_type_end]).to_string();
     
-    info!("TagIO message type via WebSocket from {}: {}", client_ip, msg_type);
-    
-    // CRITICAL: Create a flag to track if we've sent a response
-    // This prevents double responses for the same message
-    let mut response_sent = false;
+    info!("{}", log_msg("MSG-TYPE", client_ip, tagio_id, &format!("Message type: {}", msg_type)));
     
     // Handle REGL message specifically
-    if msg_type == "REGL" {
-        info!("Received REGL message from client {}, handling registration confirmation", client_ip);
-        info!("Raw REGL message: {}", hex_dump(&data, data.len()));
+    if is_regl {
+        info!("{}", log_msg("REGL", client_ip, tagio_id, "Processing registration message"));
+        debug!("{}", log_msg("REGL-RAW", client_ip, tagio_id, &format!("Raw message: {}", hex_dump(&data, data.len()))));
         
         // Log the message as text if possible
         let msg_text = String::from_utf8_lossy(&data);
-        info!("REGL message as text: {}", msg_text);
+        debug!("{}", log_msg("REGL-TXT", client_ip, tagio_id, &format!("Text: {}", msg_text)));
         
         // Track if we successfully extracted a valid ID
         let mut id_valid = false;
         let mut error_msg = "INVALID_FORMAT";
         
         // The registration data should start after the "REGL" message type
-        let register_data_offset = msg_type_offset + msg_type.len();
+        let register_data_offset = msg_type_offset + 4; // Always use 4 for REGL
         
         if register_data_offset < data.len() {
             // Get everything after the REGL message type
             let register_data = &data[register_data_offset..];
             let register_text = String::from_utf8_lossy(register_data);
             
-            info!("Registration data: '{}'", register_text);
+            info!("{}", log_msg("REG-DATA", client_ip, tagio_id, &format!("Registration data: '{}'", register_text)));
             
             // Check if it contains the REGISTER: prefix
             if register_text.contains("REGISTER:") {
@@ -901,19 +936,19 @@ async fn handle_ws_binary_message(
                     let id_str = &register_text[id_start..];
                     let id_str = id_str.trim_end_matches(|c| !char::is_ascii_digit(&c));
                     
-                    info!("Extracted ID string: '{}'", id_str);
+                    info!("{}", log_msg("REG-ID", client_ip, tagio_id, &format!("Client-provided ID: '{}'", id_str)));
                     match id_str.parse::<u32>() {
                         Ok(client_provided_id) => {
-                            info!("Successfully parsed client provided TagIO ID: {}", client_provided_id);
+                            info!("{}", log_msg("REG-PARSE", client_ip, tagio_id, &format!("Parsed TagIO ID: {}", client_provided_id)));
                             
                             // Verify that the client is using the same ID we assigned
                             if client_provided_id == tagio_id {
-                                info!("Client confirmed the correct TagIO ID: {}", tagio_id);
+                                info!("{}", log_msg("REG-MATCH", client_ip, tagio_id, "ID confirmed correct"));
                                 id_valid = true;
                             } else {
                                 error_msg = "ID_MISMATCH";
-                                warn!("Client provided TagIO ID {} doesn't match the assigned ID {}", 
-                                    client_provided_id, tagio_id);
+                                warn!("{}", log_msg("REG-ERROR", client_ip, tagio_id, 
+                                    &format!("ID mismatch: client sent {}, expected {}", client_provided_id, tagio_id)));
                             }
                             
                             // Register or update this client with their provided ID
@@ -921,107 +956,103 @@ async fn handle_ws_binary_message(
                         },
                         Err(e) => {
                             error_msg = "INVALID_ID";
-                            error!("Failed to parse TagIO ID '{}' from REGISTER message: {}", id_str, e);
+                            error!("{}", log_msg("REG-ERROR", client_ip, tagio_id, 
+                                &format!("Failed to parse TagIO ID '{}': {}", id_str, e)));
                         }
                     }
                 } else {
                     error_msg = "MISSING_ID";
-                    error!("REGISTER message format invalid, missing ID value after 'REGISTER:'");
+                    error!("{}", log_msg("REG-ERROR", client_ip, tagio_id, "REGISTER missing ID value"));
                 }
             } else {
                 error_msg = "MISSING_REGISTER";
-                error!("REGL message doesn't contain REGISTER instruction");
+                error!("{}", log_msg("REG-ERROR", client_ip, tagio_id, "Missing REGISTER instruction"));
             }
         }
         
         // Create appropriate response based on validation result
-        let mut response = Vec::with_capacity(32);
+        let mut response = Vec::new();
+        
+        // CRITICAL: Ensure full allocation before adding any bytes
+        response.reserve(32);
+                
         // Add TAGIO magic bytes
         response.extend_from_slice(PROTOCOL_MAGIC);
-        // Use protocol version 1
+        
+        // Add protocol version 1
         response.extend_from_slice(&[0, 0, 0, 1]);
         
         if id_valid {
-            // Add REGLACK message with distinctive padding to make it different size than ACK
-            response.extend_from_slice(b"REGLACK_CONFIRM");
-            info!("Sending REGLACK response to client {}", client_ip);
+            // Add REGLACK message
+            response.extend_from_slice(b"REGLACK");
+            info!("{}", log_msg("SENDING", client_ip, tagio_id, "REGLACK response"));
         } else {
             // Add REGLERR message with error reason
             response.extend_from_slice(b"REGLERR");
             response.extend_from_slice(error_msg.as_bytes());
-            error!("Sending REGLERR response to client {}: {}", client_ip, error_msg);
+            error!("{}", log_msg("SENDING", client_ip, tagio_id, &format!("REGLERR: {}", error_msg)));
         }
         
         // Log response for debugging
-        info!("Response hex dump: {}", hex_dump(&response, response.len()));
+        debug!("{}", log_msg("TX-DUMP", client_ip, tagio_id, &format!("Response hex: {}", hex_dump(&response, response.len()))));
         let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-        info!("Response bytes: [{}]", bytes_str.join(", "));
-        info!("Response as text: {}", String::from_utf8_lossy(&response));
+        debug!("{}", log_msg("TX-BYTES", client_ip, tagio_id, &format!("Bytes: [{}]", bytes_str.join(", "))));
+        debug!("{}", log_msg("TX-TEXT", client_ip, tagio_id, &format!("Text: {}", String::from_utf8_lossy(&response))));
 
-        // CRITICAL DEBUG: Log the pre-frame data
-        info!("WEBSOCKET RAW PRE-FRAME DATA: {} bytes will be sent:", response.len());
-        for (i, chunk) in response.chunks(8).enumerate() {
-            let chunk_hex: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
-            info!("   Bytes {}-{}: {}", i*8, i*8+chunk.len()-1, chunk_hex.join(" "));
+        // CRITICAL DEBUG: Log the actual bytes that will be sent
+        info!("{}", log_msg("WS-DATA", client_ip, tagio_id, &format!("Sending {} bytes:", response.len())));
+        for (i, chunk) in response.chunks(16).enumerate() {
+            let hex_dump = hex_dump(chunk, chunk.len());
+            info!("{}", log_msg("WS-HEX", client_ip, tagio_id, &format!("Chunk {}: {}", i, hex_dump)));
         }
 
-        // Send response with flush to ensure immediate delivery
-        let send_result = ws_sender.send(WsMessage::Binary(response.clone())).await;
-        
-        // CRITICAL DEBUG: Log the actual WebSocket frame being sent
-        info!("WEBSOCKET FRAME SENT - RESULT: {:?}", send_result);
-        
-        // Flush to ensure immediate delivery
-        let flush_result = ws_sender.flush().await;
-        info!("WEBSOCKET FLUSH RESULT: {:?}", flush_result);
-        
-        // Send a follow-up check message with unique identifier
-        let follow_up = {
-            let mut follow_msg = Vec::with_capacity(32);
-            follow_msg.extend_from_slice(PROTOCOL_MAGIC);
-            follow_msg.extend_from_slice(&[0, 0, 0, 1]);
-            follow_msg.extend_from_slice(b"FOLLOWUP_VERIFICATION");
-            follow_msg
-        };
-        
-        // Add a short delay to separate messages
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        
-        info!("Sending FOLLOWUP verification message");
-        let follow_result = ws_sender.send(WsMessage::Binary(follow_up)).await;
-        info!("FOLLOWUP message result: {:?}", follow_result);
+        // Ensure clean send of the REGLACK message
+        // 1. First clear any pending messages
         ws_sender.flush().await?;
         
-        info!("Successfully sent registration response to client {}", client_ip);
+        // 2. Send our response with guaranteed priority
+        ws_sender.send(WsMessage::Binary(response.clone())).await?;
         
-        // Mark that we've sent a response, to avoid sending ACK
-        response_sent = true;
+        // 3. Immediate flush to ensure delivery
+        ws_sender.flush().await?;
+        
+        info!("{}", log_msg("WS-SENT", client_ip, tagio_id, "Successfully sent registration response"));
+        
+        // CRITICAL: Return immediately without sending any ACK
+        return Ok(());
+    } else if is_ping {
+        // For PING messages, send a regular ACK
+        info!("{}", log_msg("PING", client_ip, tagio_id, "Handling PING message"));
+    } else {
+        // Log unrecognized message types
+        info!("{}", log_msg("OTHER", client_ip, tagio_id, &format!("Handling non-registration message: {}", msg_type)));
     }
     
-    // Only send a generic ACK if we haven't already sent a specific response
-    if !response_sent {
-        // For other message types, send the standard ACK response
-        let response = create_tagio_ack_response(tagio_id);
-        
-        info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-        info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-        info!("ACK response contents: {} bytes: {:?}", response.len(), response);
+    // Only send a generic ACK if it's not a REGL message
+    // For most message types, send the standard ACK response
+    let response = create_tagio_ack_response(tagio_id);
+    
+    info!("{}", log_msg("SENDING", client_ip, tagio_id, &format!("Standard ACK response with ID {}", tagio_id)));
+    debug!("{}", log_msg("ACK-DUMP", client_ip, tagio_id, &format!("ACK hex: {}", hex_dump(&response, response.len()))));
+    debug!("{}", log_msg("ACK-DATA", client_ip, tagio_id, &format!("ACK bytes: {} bytes: {:?}", response.len(), response)));
 
-        // Log each byte for debugging
-        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-        info!("ACK response bytes: [{}]", bytes_str.join(", "));
+    // Log each byte for debugging
+    let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+    debug!("{}", log_msg("ACK-BYTES", client_ip, tagio_id, &format!("[{}]", bytes_str.join(", "))));
 
-        // Send the response via WebSocket, wrapped in a binary frame
-        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
-            error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
-            return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
-        } else {
-            info!("Successfully sent ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
-        }
+    // Send the response via WebSocket, wrapped in a binary frame
+    if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
+        error!("{}", log_msg("WS-ERROR", client_ip, tagio_id, &format!("Error sending ACK: {}", e)));
+        return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
+    } else {
+        info!("{}", log_msg("ACK-SENT", client_ip, tagio_id, "Successfully sent ACK response"));
     }
+    
+    // Make sure our response is delivered
+    ws_sender.flush().await?;
     
     // Log that we processed a TagIO protocol message
-    info!("Received TagIO protocol message of {} bytes via WebSocket from {}", data.len(), client_ip);
+    info!("{}", log_msg("COMPLETE", client_ip, tagio_id, &format!("Processed {} byte TagIO message", data.len())));
     
     Ok(())
 }
@@ -1033,159 +1064,56 @@ async fn handle_ws_text_message(
     client_ip: &str, 
     ws_sender: &mut futures::stream::SplitSink<WebSocketStream<hyper::upgrade::Upgraded>, WsMessage>
 ) -> Result<(), anyhow::Error> {
-    info!("Received text WebSocket message from {}: {}", client_ip, text);
+    info!("{}", log_msg("WS-TEXT", client_ip, tagio_id, &format!("Text message: {}", text)));
     
-    // Create an ACK response for the text message
+    // Check if the text message contains a REGL request
+    if text.contains("REGL") || text.contains("REGISTER") {
+        info!("{}", log_msg("TEXT-REGL", client_ip, tagio_id, "Detected registration in text message"));
+        
+        // Create a proper REGLACK response
+        let mut response = Vec::with_capacity(16);
+        
+        // Add TAGIO magic bytes
+        response.extend_from_slice(PROTOCOL_MAGIC);
+        
+        // Add protocol version 1
+        response.extend_from_slice(&[0, 0, 0, 1]);
+        
+        // Add REGLACK message
+        response.extend_from_slice(b"REGLACK");
+        
+        info!("{}", log_msg("TX-REGLACK", client_ip, tagio_id, "Sending REGLACK for text registration"));
+        
+        // Send as binary WebSocket message
+        if let Err(e) = ws_sender.send(WsMessage::Binary(response)).await {
+            error!("{}", log_msg("TX-ERROR", client_ip, tagio_id, &format!("Error sending REGLACK: {}", e)));
+            return Err(anyhow::anyhow!("Failed to send REGLACK response: {}", e));
+        }
+        
+        // Flush to ensure delivery
+        ws_sender.flush().await?;
+        
+        info!("{}", log_msg("TX-DONE", client_ip, tagio_id, "Successfully sent REGLACK"));
+        return Ok(());
+    }
+    
+    // Create an ACK response for regular text messages
     let response = create_tagio_ack_response(tagio_id);
     
-    info!("Sending ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-    info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
+    info!("{}", log_msg("TX-ACK", client_ip, tagio_id, &format!("Sending ACK with ID: {}", tagio_id)));
+    debug!("{}", log_msg("TX-HEX", client_ip, tagio_id, &format!("ACK hex: {}", hex_dump(&response, response.len()))));
     
     // Send ACK as a binary WebSocket message
     if let Err(e) = ws_sender.send(WsMessage::Binary(response)).await {
-        error!("Error sending WebSocket ACK response to {}: {}", client_ip, e);
-        return Err(anyhow::anyhow!("Failed to send WebSocket ACK response: {}", e));
-    } else {
-        info!("Successfully sent ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        error!("{}", log_msg("TX-ERROR", client_ip, tagio_id, &format!("Error sending ACK: {}", e)));
+        return Err(anyhow::anyhow!("Failed to send ACK response: {}", e));
     }
     
-    Ok(())
-}
-
-/// Handle WebSocket client registration and message exchange
-#[allow(dead_code)]
-async fn handle_websocket_client_registration(ws_stream: WebSocketStream<hyper::upgrade::Upgraded>, peer_addr: Option<SocketAddr>, tagio_id: Option<u32>) -> Result<(), anyhow::Error> {
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    // Flush to ensure delivery
+    ws_sender.flush().await?;
     
-    info!("Handling WebSocket connection for TagIO client");
+    info!("{}", log_msg("TX-DONE", client_ip, tagio_id, "Successfully sent ACK response"));
     
-    // Track if the TagIO ID was provided from the handshake
-    let tagio_id_was_provided = tagio_id.is_some();
-
-    // Generate a unique TagIO ID for this client
-    let tagio_id = match tagio_id {
-        Some(id) => id,
-        None => generate_unique_tagio_id().await
-    };
-    let client_ip = match peer_addr {
-        Some(addr) => addr.ip().to_string(),
-        None => "unknown".to_string()
-    };
-    
-    info!("Client connecting from IP: {}", client_ip);
-    
-    // Register this client
-    register_client(tagio_id, client_ip.clone()).await;
-    
-    info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
-    
-    // Only send an initial ACK response if it wasn't already included in the handshake
-    if tagio_id_was_provided {
-        info!("TagIO ID {} was already sent in handshake response, skipping initial ACK", tagio_id);
-    } else {
-        // Send an initial ACK response immediately upon connection to reduce latency
-        let response = create_tagio_ack_response(tagio_id);
-        
-        info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-        info!("ACK response hex dump: {}", hex_dump(&response, response.len()));
-        info!("ACK response contents: {} bytes: {:?}", response.len(), response);
-        
-        // Log each byte for debugging
-        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
-        info!("ACK response bytes: [{}]", bytes_str.join(", "));
-        
-        // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
-        // Send the response via WebSocket, wrapped in a binary frame
-        if let Err(e) = ws_sender.send(WsMessage::Binary(response.clone())).await {
-            error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
-            return Ok(());
-        } else {
-            info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
-        }
-    }
-    
-    // Wait for client messages
-    while let Some(msg_result) = ws_receiver.next().await {
-        let msg = match msg_result {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("Error receiving WebSocket message from {}: {}", client_ip, e);
-                error!("WebSocket connection error details: {:#?}", e);
-                break;
-            }
-        };
-        
-        // Handle different types of WebSocket messages
-        let continue_loop = match msg {
-            WsMessage::Binary(data) => {
-                // Log the received binary data for debugging
-                info!("Received binary WebSocket data: {} bytes", data.len());
-                if data.len() >= 5 {
-                    info!("First 5 bytes: {:02X} {:02X} {:02X} {:02X} {:02X}", 
-                          data.get(0).unwrap_or(&0), 
-                          data.get(1).unwrap_or(&0),
-                          data.get(2).unwrap_or(&0),
-                          data.get(3).unwrap_or(&0),
-                          data.get(4).unwrap_or(&0));
-                }
-                
-                if let Err(e) = handle_ws_binary_message(data, tagio_id, &client_ip, &mut ws_sender).await {
-                    error!("Error handling binary message: {}", e);
-                    false
-                } else {
-                    true
-                }
-            },
-            WsMessage::Text(text) => {
-                if let Err(e) = handle_ws_text_message(text, tagio_id, &client_ip, &mut ws_sender).await {
-                    error!("Error handling text message: {}", e);
-                    false
-                } else {
-                    true
-                }
-            },
-            WsMessage::Ping(data) => {
-                // Respond to ping with pong
-                info!("Received WebSocket ping from {}, sending pong", client_ip);
-                if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
-                    error!("Error sending WebSocket pong to {}: {}", client_ip, e);
-                    false
-                } else {
-                    true
-                }
-            },
-            WsMessage::Pong(_) => {
-                // Just log pongs
-                debug!("Received WebSocket pong from {}", client_ip);
-                true
-            },
-            WsMessage::Close(_) => {
-                info!("Received WebSocket close frame from {}", client_ip);
-                false
-            },
-            _ => {
-                // Unknown message type
-                debug!("Received unknown WebSocket message type from {}", client_ip);
-                true
-            }
-        };
-        
-        if !continue_loop {
-            break;
-        }
-        
-        // Update client's last seen timestamp after each message
-        update_client_timestamp(tagio_id).await;
-    }
-    
-    // Remove client from registry when WebSocket closes
-    let mut registry = CLIENT_REGISTRY.write().await;
-    if let Some(_client) = registry.values().find(|c| c.tagio_id == tagio_id) {
-        info!("WebSocket connection closed for client {} with IP {}, removing from registry", tagio_id, client_ip);
-        registry.retain(|_, c| c.tagio_id != tagio_id);
-    }
-    
-    info!("WebSocket connection closed for {}", client_ip);
     Ok(())
 }
 
@@ -1198,66 +1126,95 @@ async fn handle_websocket_with_immediate_ack(ws_stream: WebSocketStream<hyper::u
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     
-    info!("Handling WebSocket connection for TagIO client with immediate ACK");
+    info!("{}", log_msg("WS-INIT", &client_ip, tagio_id, "Handling WebSocket connection with immediate ACK"));
     
     // Register this client
     register_client(tagio_id, client_ip.clone()).await;
     
-    info!("Registered WebSocket client with TagIO ID: {}", tagio_id);
+    info!("{}", log_msg("WS-REG", &client_ip, tagio_id, "Registered WebSocket client"));
     
+    // Flag to track if initial ACK was sent (kept for future use but prefixed with _ for now)
+    let mut _initial_ack_sent = false;
+
     // Send an initial ACK response immediately upon connection to reduce latency
-    info!("Sending immediate ACK response with TagIO ID {} via WebSocket to {}", tagio_id, client_ip);
-    info!("ACK response hex dump: {}", hex_dump(&ack_message, ack_message.len()));
-    info!("ACK response contents: {} bytes: {:?}", ack_message.len(), ack_message);
+    info!("{}", log_msg("ACK-INIT", &client_ip, tagio_id, "Sending immediate ACK"));
+    debug!("{}", log_msg("ACK-HEX", &client_ip, tagio_id, &format!("ACK hex dump: {}", hex_dump(&ack_message, ack_message.len()))));
     
     // Log each byte for debugging
     let bytes_str: Vec<String> = ack_message.iter().map(|b| format!("{:02X}", b)).collect();
-    info!("ACK response bytes: [{}]", bytes_str.join(", "));
+    debug!("{}", log_msg("ACK-BYTES", &client_ip, tagio_id, &format!("[{}]", bytes_str.join(", "))));
     
     // CRITICAL FIX: Ensure we're properly wrapping our data in WebSocket binary frames
     // Send the response via WebSocket, wrapped in a binary frame
     if let Err(e) = ws_sender.send(WsMessage::Binary(ack_message.clone())).await {
-        error!("Error sending initial WebSocket ACK response to {}: {}", client_ip, e);
+        error!("{}", log_msg("WS-ERROR", &client_ip, tagio_id, &format!("Error sending initial ACK: {}", e)));
         return Ok(());
     } else {
-        info!("Successfully sent initial ACK response with TagIO ID {} to client {}", tagio_id, client_ip);
+        info!("{}", log_msg("ACK-SENT", &client_ip, tagio_id, "Successfully sent initial ACK"));
+        _initial_ack_sent = true;
     }
+    
+    // CRITICAL: Flag to track if client has registered
+    // Once registered, we don't need to send generic ACK responses
+    let mut client_registered = false;
     
     // Wait for client messages
     while let Some(msg_result) = ws_receiver.next().await {
         let msg = match msg_result {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Error receiving WebSocket message from {}: {}", client_ip, e);
-                error!("WebSocket connection error details: {:#?}", e);
+                error!("{}", log_msg("WS-ERROR", &client_ip, tagio_id, &format!("WebSocket error: {}", e)));
                 break;
             }
         };
+        
+        // Before processing the message, check for REGL to optimize handling
+        if let WsMessage::Binary(ref data) = msg {
+            // Check for REGL message format
+            if data.len() > PROTOCOL_MAGIC.len() + 8 {  // TAGIO + version + REGL
+                let header_offset = PROTOCOL_MAGIC.len() + 4;
+                if data.len() > header_offset + 4 && 
+                   &data[header_offset..header_offset+4] == b"REGL" {
+                    info!("{}", log_msg("REGL-DET", &client_ip, tagio_id, "Detected REGL message - client registering"));
+                    // Mark client as registered so we don't send initial ACK or generic ACKs anymore
+                    client_registered = true;
+                }
+            }
+        }
         
         // Handle different types of WebSocket messages
         let continue_loop = match msg {
             WsMessage::Binary(data) => {
                 // Log the received binary data for debugging
-                info!("Received binary WebSocket data: {} bytes", data.len());
+                info!("{}", log_msg("WS-RECV", &client_ip, tagio_id, &format!("Received {} bytes", data.len())));
                 if data.len() >= 5 {
-                    info!("First 5 bytes: {:02X} {:02X} {:02X} {:02X} {:02X}", 
+                    debug!("{}", log_msg("WS-HEADER", &client_ip, tagio_id, 
+                           &format!("First 5 bytes: {:02X} {:02X} {:02X} {:02X} {:02X}", 
                           data.get(0).unwrap_or(&0), 
                           data.get(1).unwrap_or(&0),
                           data.get(2).unwrap_or(&0),
                           data.get(3).unwrap_or(&0),
-                          data.get(4).unwrap_or(&0));
+                          data.get(4).unwrap_or(&0))));
                 }
                 
+                // Handle the message - for REGL messages, handle_ws_binary_message will return early
+                // after sending REGLACK response, preventing duplicate messages
                 if let Err(e) = handle_ws_binary_message(data, tagio_id, &client_ip, &mut ws_sender).await {
-                    error!("Error handling binary message: {}", e);
+                    error!("{}", log_msg("MSG-ERROR", &client_ip, tagio_id, &format!("Error handling message: {}", e)));
                     false
                 } else {
+                    // Make sure we flush the sender to ensure all messages are delivered
+                    let _ = ws_sender.flush().await;
                     true
                 }
             },
             WsMessage::Text(text) => {
-                if let Err(e) = handle_ws_text_message(text, tagio_id, &client_ip, &mut ws_sender).await {
-                    error!("Error handling text message: {}", e);
+                // Skip text messages if client is already registered - they should be using binary
+                if client_registered {
+                    info!("{}", log_msg("TEXT-SKIP", &client_ip, tagio_id, "Client already registered, ignoring text message"));
+                    true
+                } else if let Err(e) = handle_ws_text_message(text, tagio_id, &client_ip, &mut ws_sender).await {
+                    error!("{}", log_msg("TEXT-ERR", &client_ip, tagio_id, &format!("Error handling text: {}", e)));
                     false
                 } else {
                     true
@@ -1265,26 +1222,27 @@ async fn handle_websocket_with_immediate_ack(ws_stream: WebSocketStream<hyper::u
             },
             WsMessage::Ping(data) => {
                 // Respond to ping with pong
-                info!("Received WebSocket ping from {}, sending pong", client_ip);
+                info!("{}", log_msg("WS-PING", &client_ip, tagio_id, "Received ping, sending pong"));
                 if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
-                    error!("Error sending WebSocket pong to {}: {}", client_ip, e);
+                    error!("{}", log_msg("PONG-ERR", &client_ip, tagio_id, &format!("Error sending pong: {}", e)));
                     false
                 } else {
+                    // Always flush after sending pong
+                    let _ = ws_sender.flush().await;
                     true
                 }
             },
             WsMessage::Pong(_) => {
                 // Just log pongs
-                debug!("Received WebSocket pong from {}", client_ip);
+                debug!("{}", log_msg("WS-PONG", &client_ip, tagio_id, "Received pong"));
                 true
             },
             WsMessage::Close(_) => {
-                info!("Received WebSocket close frame from {}", client_ip);
+                info!("{}", log_msg("WS-CLOSE", &client_ip, tagio_id, "Received close frame"));
                 false
             },
             _ => {
-                // Unknown message type
-                debug!("Received unknown WebSocket message type from {}", client_ip);
+                debug!("{}", log_msg("WS-OTHER", &client_ip, tagio_id, "Unknown WebSocket message type"));
                 true
             }
         };
@@ -1300,11 +1258,11 @@ async fn handle_websocket_with_immediate_ack(ws_stream: WebSocketStream<hyper::u
     // Remove client from registry when WebSocket closes
     let mut registry = CLIENT_REGISTRY.write().await;
     if let Some(_client) = registry.values().find(|c| c.tagio_id == tagio_id) {
-        info!("WebSocket connection closed for client {} with IP {}, removing from registry", tagio_id, client_ip);
+        info!("{}", log_msg("WS-CLOSE", &client_ip, tagio_id, "WebSocket connection closed, removing from registry"));
         registry.retain(|_, c| c.tagio_id != tagio_id);
     }
     
-    info!("WebSocket connection closed for {}", client_ip);
+    info!("{}", log_msg("WS-END", &client_ip, tagio_id, "WebSocket connection closed"));
     Ok(())
 }
 
