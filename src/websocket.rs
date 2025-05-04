@@ -135,6 +135,10 @@ pub async fn handle_websocket_with_immediate_ack(
 }
 
 /// Handle WebSocket client registration and message exchange without immediate ACK
+/// 
+/// Note: Clients should implement a keepalive mechanism by sending a PING message
+/// every 10-15 minutes to prevent connection timeouts. The server will respond with
+/// an ACK message, which maintains the connection.
 pub async fn handle_websocket_without_immediate_ack(
     ws_stream: WebSocketStream<Upgraded>, 
     peer_addr: Option<SocketAddr>, 
@@ -239,6 +243,9 @@ pub async fn handle_ws_binary_message(
     client_ip: &str, 
     ws_sender: &mut futures::stream::SplitSink<WebSocketStream<Upgraded>, WsMessage>
 ) -> Result<(), anyhow::Error> {
+    // Log last activity time for idle connection monitoring
+    update_client_timestamp(tagio_id).await;
+    
     info!("{}", log_msg("WS-RECV", client_ip, tagio_id, &format!("Binary message: {} bytes", data.len())));
     debug!("{}", log_msg("WS-DUMP", client_ip, tagio_id, &format!("Hex dump: {}", hex_dump(&data, data.len().min(100)))));
     
