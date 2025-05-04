@@ -1,4 +1,4 @@
-use log::{LevelFilter};
+use log::LevelFilter;
 use std::path::PathBuf;
 
 /// Initialize the logger

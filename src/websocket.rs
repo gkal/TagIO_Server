@@ -1,13 +1,12 @@
-use log::{debug, info, error, warn};
+use log::{debug, info, error};
 use hyper::upgrade::Upgraded;
 use futures::{SinkExt, StreamExt};
 use hyper_tungstenite::tungstenite::Message as WsMessage;
 use hyper_tungstenite::WebSocketStream;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
 
-use crate::lib::client::{register_client, update_client_timestamp, get_client_by_id, log_msg};
-use crate::lib::protocol::{create_tagio_ack_response, create_tagio_reglack_response, hex_dump, PROTOCOL_MAGIC};
+use crate::client::{register_client, update_client_timestamp, log_msg};
+use crate::protocol::{create_tagio_ack_response, create_tagio_reglack_response, hex_dump, PROTOCOL_MAGIC};
 
 /// Handle WebSocket client registration and message exchange with immediate ACK
 pub async fn handle_websocket_with_immediate_ack(
@@ -135,6 +134,104 @@ pub async fn handle_websocket_with_immediate_ack(
     Ok(())
 }
 
+/// Handle WebSocket client registration and message exchange without immediate ACK
+pub async fn handle_websocket_without_immediate_ack(
+    ws_stream: WebSocketStream<Upgraded>, 
+    peer_addr: Option<SocketAddr>, 
+    tagio_id: u32
+) -> Result<(), anyhow::Error> {
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    // Get a client IP string that we can use throughout the function
+    let client_ip = peer_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    info!("{}", log_msg("WS-INIT", &client_ip, tagio_id, "Handling WebSocket connection without immediate ACK"));
+    
+    // Register this client
+    register_client(tagio_id, client_ip.clone()).await;
+    
+    info!("{}", log_msg("WS-REG", &client_ip, tagio_id, "Registered WebSocket client"));
+    
+    // Wait for client messages - NO IMMEDIATE ACK
+    while let Some(msg_result) = ws_receiver.next().await {
+        let msg = match msg_result {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("{}", log_msg("WS-ERROR", &client_ip, tagio_id, &format!("WebSocket error: {}", e)));
+                break;
+            }
+        };
+        
+        // Check for REGL to optimize handling
+        if let WsMessage::Binary(ref data) = msg {
+            // Check for REGL message format
+            if data.len() > PROTOCOL_MAGIC.len() + 8 {  // TAGIO + version + REGL
+                let header_offset = PROTOCOL_MAGIC.len() + 4;
+                if data.len() > header_offset + 4 && 
+                   &data[header_offset..header_offset+4] == b"REGL" {
+                    info!("{}", log_msg("REGL-DET", &client_ip, tagio_id, "Detected REGL message - client registering"));
+                    // Mark client as registered
+                }
+            }
+        }
+        
+        // Handle different types of WebSocket messages
+        let continue_loop = match msg {
+            WsMessage::Binary(data) => {
+                if let Err(e) = handle_ws_binary_message(data, tagio_id, &client_ip, &mut ws_sender).await {
+                    error!("{}", log_msg("MSG-ERROR", &client_ip, tagio_id, &format!("Error handling message: {}", e)));
+                    false
+                } else {
+                    let _ = ws_sender.flush().await;
+                    true
+                }
+            },
+            WsMessage::Text(text) => {
+                if let Err(e) = handle_ws_text_message(text, tagio_id, &client_ip, &mut ws_sender).await {
+                    error!("{}", log_msg("TEXT-ERR", &client_ip, tagio_id, &format!("Error handling text: {}", e)));
+                    false
+                } else {
+                    true
+                }
+            },
+            WsMessage::Ping(data) => {
+                info!("{}", log_msg("WS-PING", &client_ip, tagio_id, "Received ping, sending pong"));
+                if let Err(e) = ws_sender.send(WsMessage::Pong(data)).await {
+                    error!("{}", log_msg("PONG-ERR", &client_ip, tagio_id, &format!("Error sending pong: {}", e)));
+                    false
+                } else {
+                    let _ = ws_sender.flush().await;
+                    true
+                }
+            },
+            WsMessage::Pong(_) => {
+                debug!("{}", log_msg("WS-PONG", &client_ip, tagio_id, "Received pong"));
+                true
+            },
+            WsMessage::Close(_) => {
+                info!("{}", log_msg("WS-CLOSE", &client_ip, tagio_id, "Received close frame"));
+                false
+            },
+            _ => {
+                debug!("{}", log_msg("WS-OTHER", &client_ip, tagio_id, "Unknown WebSocket message type"));
+                true
+            }
+        };
+        
+        if !continue_loop {
+            break;
+        }
+        
+        // Update client's last seen timestamp after each message
+        update_client_timestamp(tagio_id).await;
+    }
+    
+    info!("{}", log_msg("WS-END", &client_ip, tagio_id, "WebSocket connection closed"));
+    Ok(())
+}
+
 /// Handle binary WebSocket messages
 pub async fn handle_ws_binary_message(
     data: Vec<u8>, 
@@ -200,13 +297,17 @@ pub async fn handle_ws_binary_message(
         info!("{}", log_msg("REGL", client_ip, tagio_id, "Processing registration message"));
         
         // REGL message validation omitted for brevity - would check for valid ID format
-        let id_valid = true; // Simplified for example
+        let _id_valid = true; // Simplified for example
         
         // Create REGLACK response
         let response = create_tagio_reglack_response();
         
         info!("{}", log_msg("SENDING", client_ip, tagio_id, "REGLACK response"));
         debug!("{}", log_msg("TX-DUMP", client_ip, tagio_id, &format!("Response hex: {}", hex_dump(&response, response.len()))));
+        
+        // Log the exact bytes for debugging
+        let bytes_str: Vec<String> = response.iter().map(|b| format!("{:02X}", b)).collect();
+        info!("{}", log_msg("TX-BYTES", client_ip, tagio_id, &format!("[{}]", bytes_str.join(", "))));
         
         // Ensure clean send
         ws_sender.flush().await?;

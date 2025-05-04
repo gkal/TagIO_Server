@@ -2,22 +2,21 @@ use anyhow;
 use clap::Parser;
 use hyper::{Body, Request, Response, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
-use hyper::server::conn::AddrStream;
 use log::{debug, info, error, warn, LevelFilter};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tokio::net::TcpListener;
 
 // Import our modularized code
-use http_tunnel_server::lib::client::{cleanup_stale_clients};
-use http_tunnel_server::lib::logger::setup_logger;
-use http_tunnel_server::lib::protocol::{print_tagio_protocol_spec, find_tagio_magic};
-use http_tunnel_server::lib::http::{extract_tagio_from_http, serve_status_page, handle_tagio_over_http};
-use http_tunnel_server::lib::websocket::handle_websocket_with_immediate_ack;
-use http_tunnel_server::lib::client::{generate_unique_tagio_id, log_msg};
-use http_tunnel_server::lib::protocol;
+use tagio_workspace::client::cleanup_stale_clients;
+use tagio_workspace::logger::setup_logger;
+use tagio_workspace::protocol::{print_tagio_protocol_spec, find_tagio_magic};
+use tagio_workspace::http::{extract_tagio_from_http, serve_status_page, handle_tagio_over_http};
+// Use the non-immediate ACK WebSocket handler
+use tagio_workspace::websocket::handle_websocket_without_immediate_ack;
+use tagio_workspace::client::generate_unique_tagio_id;
+use tagio_workspace::protocol;
 
 #[derive(Parser)]
 #[clap(author = "TagIO Team", version, about = "TagIO HTTP Tunnel Server")]
@@ -92,19 +91,13 @@ async fn handle_http_request(req: Request<Body>, _debug_mode: bool) -> Result<Re
                 let tagio_id = generate_unique_tagio_id().await;
                 info!("Generated TagIO ID {} for WebSocket client {}", tagio_id, client_ip);
                 
-                // Create ACK response with the TagIO ID
-                let ack_message = protocol::create_tagio_ack_response(tagio_id);
-                
-                // Log the ACK message for debugging
-                info!("ACK message prepared for immediate sending after handshake - {} bytes", ack_message.len());
-                
                 // Spawn a new task to handle the WebSocket connection
                 tokio::spawn(async move {
                     match websocket.await {
                         Ok(ws_stream) => {
-                            info!("WebSocket connection established, sending immediate ACK with TagIO ID {}", tagio_id);
-                            // Handle the WebSocket connection with immediate ACK message
-                            if let Err(e) = handle_websocket_with_immediate_ack(ws_stream, peer_addr, tagio_id, ack_message).await {
+                            info!("WebSocket connection established for client with TagIO ID {}", tagio_id);
+                            // Use the new handler WITHOUT sending immediate ACK message
+                            if let Err(e) = handle_websocket_without_immediate_ack(ws_stream, peer_addr, tagio_id).await {
                                 error!("Error in WebSocket connection: {}", e);
                             }
                         },

@@ -1,10 +1,8 @@
-use log::{debug, info, error, warn};
-use hyper::{Body, Request, Response, StatusCode};
-use std::convert::Infallible;
-use hyper::service::{make_service_fn, service_fn};
+use log::{debug, info, error};
+use hyper::{Body, Response, StatusCode};
 
-use crate::lib::client::{register_client, update_client_timestamp, get_client_by_id, generate_unique_tagio_id, log_msg};
-use crate::lib::protocol::{PROTOCOL_MAGIC, find_tagio_magic, hex_dump};
+use crate::client::{register_client, generate_unique_tagio_id, CLIENT_REGISTRY};
+use crate::protocol::{PROTOCOL_MAGIC, hex_dump};
 
 /// Extract TagIO protocol data from HTTP headers and body
 pub fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool {
@@ -30,7 +28,7 @@ pub fn extract_tagio_from_http(headers: &hyper::HeaderMap, body: &[u8]) -> bool 
 /// Serves an HTML status page with TagIO connection instructions
 pub async fn serve_status_page() -> Result<Response<Body>, hyper::http::Error> {
     // Get current count of connected clients
-    let client_count = crate::lib::client::CLIENT_REGISTRY.read().await.len();
+    let client_count = CLIENT_REGISTRY.read().await.len();
     
     // Simple HTML template that can be expanded if needed
     let html = format!(r#"

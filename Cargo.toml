@@ -4,21 +4,65 @@
 # !!! 1. http_tunnel_server - The HTTP tunnel server                !!!
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-[workspace]
-members = ["standalone_server"]
-default-members = ["standalone_server"]
-
 [package]
 name = "tagio_workspace"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["TagIO Team"]
 description = "TagIO HTTP Tunnel Server - Standalone HTTP tunneling server for TagIO"
 
-# This is just a placeholder to satisfy Cargo requirements
+# This is the main library
 [lib]
-name = "tagio_workspace_lib"
+name = "tagio_workspace"
 path = "src/lib.rs"
+
+# Define the binary target
+[[bin]]
+name = "http_tunnel_server"
+path = "src/bin/http_tunnel_server.rs"
+
+[dependencies]
+# Core async runtime - only include what we need
+tokio = { version = "1.32", features = ["macros", "rt-multi-thread", "io-util", "net", "time", "sync"] }
+# Error handling
+anyhow = "1.0"
+# Serialization - essential for the protocol
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3.3"
+# Logging
+log = "0.4"
+env_logger = "0.10.0"
+# Regular expressions for log filtering
+regex = "1.10.2"
+# NAT traversal - necessary for peer connections
+socket2 = "0.5.9"
+# Command line argument parsing - simplified feature set
+clap = { version = "4.4", features = ["derive"] }
+# IP address utilities
+local-ip-address = "0.5"
+# Simple HTTP client for public IP detection
+ureq = { version = "2.7", features = ["json"] }
+serde_json = "1.0"
+chrono = "0.4"
+fern = "0.6"
+colored = "2.0.0"
+rand = "0.8"
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+http = "0.2.9"
+# TLS support for HTTPS server
+rustls = "0.21.6"
+rustls-pemfile = "1.0.2"
+hyper-rustls = { version = "0.24.1", features = ["http1", "http2"] }
+tokio-rustls = "0.24.1"
+rcgen = "0.11.1"
+async-stream = "0.3.5"
+# Client registry static initialization
+lazy_static = "1.4"
+# WebSocket support
+futures = "0.3"
+tokio-tungstenite = "0.19.0"
+hyper-tungstenite = "0.11"
+tungstenite = "0.20"
 
 [profile.release]
 opt-level = "z"     # Optimize for size, not speed

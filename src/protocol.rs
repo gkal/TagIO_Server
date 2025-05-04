@@ -1,4 +1,4 @@
-use log::{debug, info, error, warn};
+use log::debug;
 use std::fmt;
 
 // Constants for protocol magic
